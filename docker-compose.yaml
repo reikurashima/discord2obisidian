@@ -1,0 +1,11 @@
+services:
+  discord-bot:
+    build: .
+    container_name: discord-obsidian-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    # Uncomment the volume below if using STORAGE_MODE=local
+    # Map your NAS Obsidian vault path into the container
+    # volumes:
+    #   - /path/to/your/obsidian/vault:/vault
