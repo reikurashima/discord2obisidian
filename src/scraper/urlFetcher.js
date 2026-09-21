@@ -1,8 +1,7 @@
-import { Readability } from '@mozilla/readability';
-import { parseHTML } from 'linkedom';
 import { logger } from '../utils/logger.js';
 
 const TWITTER_REGEX = /https?:\/\/(www\.)?(twitter\.com|x\.com)\/(\w+)\/status\/(\d+)/;
+const YOUTUBE_REGEX = /https?:\/\/(www\.)?(youtube\.com\/watch\?v=|youtube\.com\/shorts\/|youtu\.be\/|youtube\.com\/live\/)/;
 const URL_REGEX = /https?:\/\/\S+/;
 
 /**
@@ -25,8 +24,9 @@ export function extractUrl(text) {
 }
 
 /**
- * Fetch content from a URL (auto-detects Twitter vs article).
+ * Fetch content from a URL (auto-detects Twitter / YouTube / article).
  * Returns {
+ *   type: 'twitter' | 'youtube' | 'article',
  *   text, imageUrls, videoUrls, sourceUrl,
  *   author: { name, screenName, url } | null
  * }
@@ -38,6 +38,11 @@ export async function fetchUrlContent(url) {
     const screenName = twitterMatch[3];
     const tweetId = twitterMatch[4];
     return fetchTweet(screenName, tweetId, url);
+  }
+
+  if (YOUTUBE_REGEX.test(url)) {
+    logger.info(`[Scraper] YouTube URL detected: ${url}`);
+    return { type: 'youtube', text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
   }
 
   return fetchArticle(url);
@@ -109,7 +114,7 @@ async function fetchTweet(screenName, tweetId, originalUrl) {
     }
 
     logger.info(`[Scraper] Tweet by @${author.screenName}: "${text.substring(0, 50)}..." (${imageUrls.length} images, ${videoUrls.length} videos)`);
-    return { text, imageUrls, videoUrls, sourceUrl: originalUrl, author };
+    return { type: 'twitter', text, imageUrls, videoUrls, sourceUrl: originalUrl, author };
   } catch (error) {
     logger.error(`[Scraper] Failed to fetch tweet: ${error.message}`);
     return emptyResult(originalUrl, screenName);
@@ -118,6 +123,7 @@ async function fetchTweet(screenName, tweetId, originalUrl) {
 
 function emptyResult(url, screenName = null) {
   return {
+    type: 'twitter',
     text: '',
     imageUrls: [],
     videoUrls: [],
@@ -127,7 +133,8 @@ function emptyResult(url, screenName = null) {
 }
 
 /**
- * Fetch article content via Readability.
+ * Fetch article page and extract 1 representative image (og:image or first img tag).
+ * No text extraction.
  */
 async function fetchArticle(url) {
   try {
@@ -142,48 +149,42 @@ async function fetchArticle(url) {
 
     if (!response.ok) {
       logger.warn(`[Scraper] HTTP ${response.status} for ${url}`);
-      return { text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
+      return { type: 'article', text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
     }
 
     const html = await response.text();
-    const { document } = parseHTML(html);
-    const reader = new Readability(document);
-    const article = reader.parse();
 
-    if (!article) {
-      logger.warn(`[Scraper] Readability could not parse ${url}`);
-      return { text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
+    // Try og:image first
+    const ogMatch = html.match(/<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i)
+      || html.match(/<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i);
+
+    if (ogMatch) {
+      let imgUrl = ogMatch[1];
+      if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
+      logger.info(`[Scraper] Article og:image found: ${imgUrl.substring(0, 80)}`);
+      return { type: 'article', text: '', imageUrls: [imgUrl], videoUrls: [], sourceUrl: url, author: null };
     }
 
-    // Extract image URLs from article HTML
-    const imageUrls = [];
+    // Fallback: first img tag that's not tiny/svg/ico
     const imgRegex = /<img[^>]+src=["']([^"']+)["']/gi;
     let match;
-    while ((match = imgRegex.exec(article.content)) !== null) {
+    while ((match = imgRegex.exec(html)) !== null) {
       let imgUrl = match[1];
-      if (imgUrl.startsWith('//')) {
-        imgUrl = 'https:' + imgUrl;
-      } else if (imgUrl.startsWith('/')) {
+      if (imgUrl.startsWith('data:')) continue;
+      if (/\.(svg|ico)(\?|$)/i.test(imgUrl)) continue;
+      if (imgUrl.startsWith('//')) imgUrl = 'https:' + imgUrl;
+      else if (imgUrl.startsWith('/')) {
         const base = new URL(url);
         imgUrl = base.origin + imgUrl;
       }
-      if (imgUrl.startsWith('data:')) continue;
-      if (/\.(svg|ico)(\?|$)/i.test(imgUrl)) continue;
-      imageUrls.push(imgUrl);
+      logger.info(`[Scraper] Article fallback image found: ${imgUrl.substring(0, 80)}`);
+      return { type: 'article', text: '', imageUrls: [imgUrl], videoUrls: [], sourceUrl: url, author: null };
     }
 
-    const limitedImages = imageUrls.slice(0, 4);
-
-    logger.info(`[Scraper] Article parsed: "${article.title}" (${limitedImages.length} images)`);
-    return {
-      text: article.textContent?.substring(0, 5000) || '',
-      imageUrls: limitedImages,
-      videoUrls: [],
-      sourceUrl: url,
-      author: null,
-    };
+    logger.info(`[Scraper] No images found for article: ${url}`);
+    return { type: 'article', text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
   } catch (error) {
     logger.error(`[Scraper] Failed to fetch article: ${url}`, error);
-    return { text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
+    return { type: 'article', text: '', imageUrls: [], videoUrls: [], sourceUrl: url, author: null };
   }
 }

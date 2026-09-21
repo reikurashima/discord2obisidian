@@ -8,12 +8,7 @@ discordClient.once('ready', () => {
   logger.info(`Storage mode: ${config.storage.mode}`);
   logger.info(`Note channel: ${config.discord.channelId}`);
   logger.info(`Daily channel: ${config.discord.dailyChannelId}`);
-
-  if (config.discord.aiClipChannelId) {
-    logger.info(`AI Clip channel: ${config.discord.aiClipChannelId}`);
-  } else {
-    logger.info('AI Clip channel: not configured');
-  }
+  logger.info(`Canvas channel: ${config.discord.canvasChannelId || 'not configured'}`);
 
   if (config.storage.mode === 'dropbox') {
     logger.info(`Dropbox folder: ${config.dropbox.folderPath}`);

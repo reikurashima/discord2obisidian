@@ -14,6 +14,12 @@ export async function uploadFile(filename, content, bodyOnly) {
   const existing = await downloadFile(filePath);
 
   if (existing) {
+    // Nothing to append (e.g. a single-line message whose only content is the
+    // title): leave the existing note untouched.
+    if (!bodyOnly || !bodyOnly.trim()) {
+      logger.info(`[Local] Nothing to append, existing note left unchanged: ${filePath}`);
+      return { path_display: filePath };
+    }
     const appended = existing.trimEnd() + '\n\n' + bodyOnly.trimStart();
     await fs.writeFile(filePath, appended, 'utf-8');
     logger.info(`[Local] Appended to existing: ${filePath}`);

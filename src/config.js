@@ -33,18 +33,13 @@ for (const key of required) {
   }
 }
 
-// ---- Warn for optional features ----
-if (process.env.DISCORD_AICLIP_CHANNEL_ID && !process.env.GEMINI_API_KEY) {
-  console.warn('[WARN] DISCORD_AICLIP_CHANNEL_ID is set but GEMINI_API_KEY is missing. AI Clip feature will be disabled.');
-}
-
 export const config = {
   // --- Discord ---
   discord: {
     token: process.env.DISCORD_TOKEN,
     channelId: process.env.DISCORD_CHANNEL_ID,
     dailyChannelId: process.env.DISCORD_DAILY_CHANNEL_ID,
-    aiClipChannelId: process.env.DISCORD_AICLIP_CHANNEL_ID || null,
+    canvasChannelId: process.env.DISCORD_CANVAS_CHANNEL_ID || null,
   },
 
   // --- Storage ---
@@ -59,10 +54,5 @@ export const config = {
     clientSecret: process.env.DROPBOX_CLIENT_SECRET || null,
     refreshToken: process.env.DROPBOX_REFRESH_TOKEN || null,
     folderPath: process.env.DROPBOX_FOLDER_PATH || null,
-  },
-
-  // --- Gemini AI ---
-  ai: {
-    geminiApiKey: process.env.GEMINI_API_KEY || null,
   },
 };

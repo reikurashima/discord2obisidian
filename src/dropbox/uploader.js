@@ -10,6 +10,12 @@ export async function uploadToDropbox(filename, content, bodyOnly) {
   const existing = await downloadFromDropbox(filePath);
 
   if (existing) {
+    // Nothing to append (e.g. a single-line message whose only content is the
+    // title): leave the existing note untouched.
+    if (!bodyOnly || !bodyOnly.trim()) {
+      logger.info(`Nothing to append, existing note left unchanged: ${filePath}`);
+      return { '.tag': 'file', path_display: filePath };
+    }
     // Append to existing note
     const appended = existing.trimEnd() + '\n\n' + bodyOnly.trimStart();
     const response = await dbx.filesUpload({

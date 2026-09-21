@@ -5,7 +5,20 @@ services:
     restart: unless-stopped
     env_file:
       - .env
-    # Uncomment the volume below if using STORAGE_MODE=local
-    # Map your NAS Obsidian vault path into the container
-    # volumes:
-    #   - /path/to/your/obsidian/vault:/vault
+    environment:
+      # ⚠ 未設定だとコンテナはUTCで動き、日付の変わり目が朝9時になる。
+      #    JST 0:00〜9:00 の投稿が前日のデイリーノートに入る事故が起きていた（2026-09-21 修正）
+      - TZ=Asia/Tokyo
+    logging:
+      # 既定の json-file はローテーションしないため、長期稼働でディスクを食い続ける
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # 左辺 = NAS本体(UGOS/Linux)上での Obsidian Vault の実パス。
+      #   Windowsから見た \\NiceNAS-01\syncdata\library を、NAS内のローカルパスに読み替えたもの。
+      #   UGOSの「ファイル」アプリや共有フォルダ設定で syncdata の場所を確認して書き換えてください
+      #   （UGREENでは多くの場合 /volume1/... 配下になります）。
+      # 右辺 = コンテナ内のパス。.env の LOCAL_VAULT_PATH と必ず一致させること。
+      - /volume1/syncdata/library:/vault

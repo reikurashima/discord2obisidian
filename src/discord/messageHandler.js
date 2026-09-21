@@ -1,12 +1,16 @@
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 import { sanitizeFilename } from '../utils/sanitize.js';
-import { formatMarkdown, formatDailyEntry, formatTweetEntry, formatTweetNote, buildDailyFile } from '../utils/markdown.js';
+import {
+  formatMarkdown, formatTweetNote, formatYoutubeNote, formatArticleNote,
+  formatDailyEntry, formatTweetEntry, formatYoutubeEntry, formatArticleEntry,
+  buildDailyFile,
+} from '../utils/markdown.js';
 import { uploadNote, uploadImage, downloadFile, overwriteFile, getDailyFilePath } from '../storage/index.js';
 import { generateImageFilename, convertToWebp } from '../utils/image.js';
-import { handleAiClipMessage } from './aiClipHandler.js';
 import { containsUrl, extractUrl, fetchUrlContent } from '../scraper/urlFetcher.js';
 import { downloadAndProcessImages, downloadAndProcessVideos } from '../scraper/imageDownloader.js';
+import { handleCanvasMessage } from './canvasHandler.js';
 
 const IMAGE_CONTENT_TYPES = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/bmp', 'image/tiff'];
 
@@ -62,7 +66,35 @@ async function handleNoteMessage(message) {
         logger.info(`[Note] URL detected: ${urlData.url}`);
         const content = await fetchUrlContent(urlData.url);
 
-        // Download media from URL
+        if (content.type === 'youtube') {
+          // === YouTube: embed URL + #youtube tag ===
+          const { title, content: fileContent, bodyOnly } = formatYoutubeNote(content.sourceUrl, urlData.comment);
+          const filename = sanitizeFilename(title);
+          await uploadNote(filename, fileContent, bodyOnly);
+          logger.info(`[Note] YouTube saved as ${filename}.md`);
+          await message.react('✅');
+          return;
+        }
+
+        if (content.type === 'article') {
+          // === Article: embed URL + 1 image ===
+          const articleImageNames = content.imageUrls.length > 0
+            ? await downloadAndProcessImages(content.imageUrls, 1)
+            : [];
+          const discordImageNames = hasImages
+            ? await processDiscordImages([...message.attachments.values()])
+            : [];
+          const allImageNames = [...articleImageNames, ...discordImageNames];
+
+          const { title, content: fileContent, bodyOnly } = formatArticleNote(content.sourceUrl, allImageNames, urlData.comment);
+          const filename = sanitizeFilename(title);
+          await uploadNote(filename, fileContent, bodyOnly);
+          logger.info(`[Note] Article saved as ${filename}.md`);
+          await message.react('✅');
+          return;
+        }
+
+        // === Twitter: keep existing behavior ===
         const urlImageNames = content.imageUrls.length > 0
           ? await downloadAndProcessImages(content.imageUrls)
           : [];
@@ -75,12 +107,12 @@ async function handleNoteMessage(message) {
         const allImageNames = [...urlImageNames, ...discordImageNames];
 
         const { title, content: fileContent, bodyOnly } = formatTweetNote(
-          content.text, content.sourceUrl, allImageNames, videoNames, content.author,
+          content.text, content.sourceUrl, allImageNames, videoNames, content.author, urlData.comment,
         );
 
         const filename = sanitizeFilename(title);
         await uploadNote(filename, fileContent, bodyOnly);
-        logger.info(`Successfully saved as ${filename}.md`);
+        logger.info(`[Note] Tweet saved as ${filename}.md`);
         await message.react('✅');
         return;
       }
@@ -126,6 +158,39 @@ async function handleDailyMessage(message) {
         logger.info(`[Daily] URL detected: ${urlData.url}`);
         const content = await fetchUrlContent(urlData.url);
 
+        if (content.type === 'youtube') {
+          // === YouTube: embed URL + #youtube tag ===
+          const entry = formatYoutubeEntry(content.sourceUrl, urlData.comment);
+          const dailyFilePath = getDailyFilePath();
+          const existing = await downloadFile(dailyFilePath);
+          const fullContent = buildDailyFile(existing, entry);
+          await overwriteFile(dailyFilePath, fullContent);
+          logger.info(`[Daily] YouTube appended to daily note`);
+          await message.react('✅');
+          return;
+        }
+
+        if (content.type === 'article') {
+          // === Article: embed URL + 1 image ===
+          const articleImageNames = content.imageUrls.length > 0
+            ? await downloadAndProcessImages(content.imageUrls, 1)
+            : [];
+          const discordImageNames = hasImages
+            ? await processDiscordImages([...message.attachments.values()])
+            : [];
+          const allImageNames = [...articleImageNames, ...discordImageNames];
+
+          const entry = formatArticleEntry(content.sourceUrl, allImageNames, urlData.comment);
+          const dailyFilePath = getDailyFilePath();
+          const existing = await downloadFile(dailyFilePath);
+          const fullContent = buildDailyFile(existing, entry);
+          await overwriteFile(dailyFilePath, fullContent);
+          logger.info(`[Daily] Article appended to daily note`);
+          await message.react('✅');
+          return;
+        }
+
+        // === Twitter: keep existing behavior ===
         const urlImageNames = content.imageUrls.length > 0
           ? await downloadAndProcessImages(content.imageUrls)
           : [];
@@ -138,7 +203,7 @@ async function handleDailyMessage(message) {
         const allImageNames = [...urlImageNames, ...discordImageNames];
 
         const entry = formatTweetEntry(
-          content.text, content.sourceUrl, allImageNames, videoNames, content.author,
+          content.text, content.sourceUrl, allImageNames, videoNames, content.author, urlData.comment,
         );
 
         const dailyFilePath = getDailyFilePath();
@@ -146,7 +211,7 @@ async function handleDailyMessage(message) {
         const fullContent = buildDailyFile(existing, entry);
         await overwriteFile(dailyFilePath, fullContent);
 
-        logger.info(`[Daily] Appended tweet to daily note`);
+        logger.info(`[Daily] Tweet appended to daily note`);
         await message.react('✅');
         return;
       }
@@ -182,7 +247,7 @@ export async function handleMessage(message) {
     return handleDailyMessage(message);
   }
 
-  if (config.discord.aiClipChannelId && message.channelId === config.discord.aiClipChannelId) {
-    return handleAiClipMessage(message);
+  if (config.discord.canvasChannelId && message.channelId === config.discord.canvasChannelId) {
+    return handleCanvasMessage(message);
   }
 }

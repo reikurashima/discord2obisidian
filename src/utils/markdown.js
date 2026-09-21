@@ -7,12 +7,8 @@ export function formatMarkdown(message, imageNames = []) {
 
   const frontmatter = makeFrontmatter();
 
-  let body;
-  if (bodyLines.length === 0) {
-    body = firstLine;
-  } else {
-    body = bodyLines.join('\n').trim();
-  }
+  // First line is always the title; it is never part of the body.
+  let body = bodyLines.join('\n').trim();
 
   if (imageNames.length > 0) {
     const imageLinks = imageNames
@@ -30,11 +26,16 @@ export function formatMarkdown(message, imageNames = []) {
 
 /**
  * Format a tweet/URL as a full note page (Note channel).
- * Title = author name (no date).
+ * Title = first 20 chars of tweet text.
  */
-export function formatTweetNote(tweetText, sourceUrl, imageNames = [], videoNames = [], author = null) {
+export function formatTweetNote(tweetText, sourceUrl, imageNames = [], videoNames = [], author = null, comment = null) {
   const frontmatter = makeFrontmatter();
   const parts = [];
+
+  // User comment (text sent alongside the URL) goes first
+  if (comment) {
+    parts.push(comment);
+  }
 
   // Tweet text (bold)
   if (tweetText) {
@@ -64,11 +65,63 @@ export function formatTweetNote(tweetText, sourceUrl, imageNames = [], videoName
 
   const body = parts.join('\n');
 
-  // Title = author name only (no date)
-  const title = author ? author.name : 'clip';
+  // Title = first 20 chars of tweet text
+  const title = tweetText
+    ? tweetText.replace(/\n/g, ' ').substring(0, 20).trim()
+    : (author ? author.name : 'clip');
 
   return {
     title,
+    content: frontmatter + body + '\n',
+    bodyOnly: body + '\n',
+  };
+}
+
+/**
+ * Format a YouTube URL as a note (Note channel).
+ * Title = URL.
+ */
+export function formatYoutubeNote(sourceUrl, comment = null) {
+  const frontmatter = makeFrontmatter();
+  const parts = [];
+
+  // User comment (text sent alongside the URL) goes first
+  if (comment) {
+    parts.push(comment);
+  }
+  parts.push(`![](${sourceUrl})`);
+  parts.push('#youtube');
+  const body = parts.join('\n');
+
+  return {
+    title: sourceUrl,
+    content: frontmatter + body + '\n',
+    bodyOnly: body + '\n',
+  };
+}
+
+/**
+ * Format an article URL as a note (Note channel).
+ * Title = URL.
+ */
+export function formatArticleNote(sourceUrl, imageNames = [], comment = null) {
+  const frontmatter = makeFrontmatter();
+  const parts = [];
+
+  // User comment (text sent alongside the URL) goes first
+  if (comment) {
+    parts.push(comment);
+  }
+  parts.push(`![](${sourceUrl})`);
+
+  if (imageNames.length > 0) {
+    parts.push(`![[${imageNames[0]}|350]]`);
+  }
+
+  const body = parts.join('\n');
+
+  return {
+    title: sourceUrl,
     content: frontmatter + body + '\n',
     bodyOnly: body + '\n',
   };
@@ -90,19 +143,15 @@ export function formatDailyEntry(message, imageNames = []) {
 }
 
 /**
- * Format a tweet entry for Daily / AI Clip channels.
- *
- * Output format:
- * ***
- * **本文**
- * ![[image.webp|350]]
- * ![[video.mp4]]
- * [[投稿者名]] @screen_name
- * [🔗link](URL) #Xclip
- * ***
+ * Format a tweet entry for Daily channel.
  */
-export function formatTweetEntry(tweetText, sourceUrl, imageNames = [], videoNames = [], author = null) {
+export function formatTweetEntry(tweetText, sourceUrl, imageNames = [], videoNames = [], author = null, comment = null) {
   const lines = ['***'];
+
+  // User comment (text sent alongside the URL) goes first
+  if (comment) {
+    lines.push(comment);
+  }
 
   // Tweet text (bold)
   if (tweetText) {
@@ -132,19 +181,33 @@ export function formatTweetEntry(tweetText, sourceUrl, imageNames = [], videoNam
 }
 
 /**
- * Format an AI Clip entry (text cleanup mode, no URL).
+ * Format a YouTube entry for Daily channel.
  */
-export function formatAiClipEntry(text, imageNames = []) {
-  let entry = `- ${text}`;
-
-  if (imageNames.length > 0) {
-    const imageLinks = imageNames
-      .map((name) => `\n\t- ![[${name}|350]]`)
-      .join('');
-    entry += imageLinks;
+export function formatYoutubeEntry(sourceUrl, comment = null) {
+  const lines = ['***'];
+  if (comment) {
+    lines.push(comment);
   }
+  lines.push(`![](${sourceUrl})`);
+  lines.push('#youtube');
+  lines.push('***');
+  return lines.join('\n');
+}
 
-  return entry;
+/**
+ * Format an article entry for Daily channel.
+ */
+export function formatArticleEntry(sourceUrl, imageNames = [], comment = null) {
+  const lines = ['***'];
+  if (comment) {
+    lines.push(comment);
+  }
+  lines.push(`![](${sourceUrl})`);
+  if (imageNames.length > 0) {
+    lines.push(`![[${imageNames[0]}|350]]`);
+  }
+  lines.push('***');
+  return lines.join('\n');
 }
 
 // ========== Daily file builder ==========

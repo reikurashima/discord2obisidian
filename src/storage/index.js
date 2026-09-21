@@ -1,4 +1,5 @@
 import path from 'path';
+import fs from 'fs';
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
 
@@ -87,4 +88,70 @@ export function getDailyFilePath() {
     return path.join(basePath, `${dateStr}.md`);
   }
   return `${basePath}/${dateStr}.md`;
+}
+
+/**
+ * Get the canvas file path: basePath/<name>.canvas
+ */
+export function getCanvasFilePath(name) {
+  const basePath = getBasePath();
+
+  if (config.storage.mode === 'local') {
+    return path.join(basePath, `${name}.canvas`);
+  }
+  return `${basePath}/${name}.canvas`;
+}
+
+// Cache the resolved vault-relative images path (see getVaultRelativeImagesPath).
+let cachedVaultRelativeImagesPath = null;
+
+/**
+ * Resolve the images directory as a path relative to the Obsidian vault root,
+ * which is what a JSON Canvas "file" node expects.
+ *
+ * - local: walk up to 3 levels from basePath looking for a `.obsidian` directory.
+ *   If found, that directory is the vault root and the relative path is computed
+ *   from it to basePath/images. Otherwise fall back to 'images'.
+ * - dropbox: always 'images'.
+ *
+ * The result is cached for the process lifetime.
+ */
+export function getVaultRelativeImagesPath() {
+  if (cachedVaultRelativeImagesPath !== null) {
+    return cachedVaultRelativeImagesPath;
+  }
+
+  if (config.storage.mode !== 'local') {
+    cachedVaultRelativeImagesPath = 'images';
+    return cachedVaultRelativeImagesPath;
+  }
+
+  const basePath = getBasePath();
+  const imagesPath = path.join(basePath, 'images');
+
+  let vaultRoot = null;
+  let current = basePath;
+  for (let i = 0; i <= 3; i++) {
+    try {
+      if (fs.existsSync(path.join(current, '.obsidian'))) {
+        vaultRoot = current;
+        break;
+      }
+    } catch {
+      // Ignore fs errors and keep walking up.
+    }
+    const parent = path.dirname(current);
+    if (parent === current) break; // reached filesystem root
+    current = parent;
+  }
+
+  if (vaultRoot) {
+    cachedVaultRelativeImagesPath = path.relative(vaultRoot, imagesPath).split(path.sep).join('/');
+    logger.info(`[Storage] Vault root found at ${vaultRoot}, images relative path: ${cachedVaultRelativeImagesPath}`);
+  } else {
+    cachedVaultRelativeImagesPath = 'images';
+    logger.info(`[Storage] No .obsidian vault root found near ${basePath}, using 'images'`);
+  }
+
+  return cachedVaultRelativeImagesPath;
 }
