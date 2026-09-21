@@ -71,6 +71,23 @@ export function parseEndTime(input, nowMs = Date.now()) {
   return { ok: false, reason: '形式が違います（例: `23:00` または `+90m`）' };
 }
 
+/**
+ * VCステータス用の "HH:mm"。**必ずJST**で出す。
+ *
+ * ⚠ ここだけは `TZ` に依存させない。
+ *   <t:...:R> と違いステータスは「Botが書いた文字列」がそのまま出るため、
+ *   コンテナがUTCで起動していると 9時間ずれた時刻を堂々と表示してしまう。
+ *   （compose の TZ が無視される事故は実際に起きている — ルートの CLAUDE.md 参照）
+ *   JSTは夏時間が無いので、UTC+9 の固定オフセットで計算すれば常に正しい。
+ *
+ * @param {number} ms epoch ミリ秒
+ */
+export function jstClock(ms) {
+  const shifted = new Date(ms + 9 * 60 * 60 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(shifted.getUTCHours())}:${p(shifted.getUTCMinutes())}`;
+}
+
 /** ログ・確認メッセージ用。ローカルタイム（=JST想定）で "2026-09-22 23:00" にする */
 export function formatLocal(ms) {
   const d = new Date(ms);

@@ -67,9 +67,8 @@ export function createLogger(echo = false) {
  *   実機の 400 / code 40032 "Target user is not connected to voice." と同じ振る舞い。
  */
 export class StubGateway {
-  constructor({ vcChannelId, channelName = '作業部屋' } = {}) {
+  constructor({ vcChannelId } = {}) {
     this.vcChannelId = vcChannelId;
-    this.channelName = channelName;
     /** @type {Map<string, string>} userId → channelId */
     this.connections = new Map();
     this.serverMuted = new Set();
@@ -80,17 +79,23 @@ export class StubGateway {
     /** @type {Map<string, string>} messageId → 現在の本文 */
     this.messages = new Map();
     this.messageSeq = 0;
+    /** setVoiceStatus に渡された文字列の履歴（"" はクリア） */
     this.voiceStatuses = [];
-    this.renames = [];
+    /** @type {Map<string, string[]>} channelId → ステータス履歴 */
+    this.voiceStatusByChannel = new Map();
     this.disconnected = [];
 
     // 失敗注入用
     this.failVoiceStatus = false;
-    this.failRename = false;
     this.failEdit = false;
     this.failUnmuteFor = new Set();
-    this.voiceStatusDisabled = false;
-    this.voiceStatusWarnCount = 0;
+    /** 失敗が何回起きたか（＝実装が諦めずに毎回試しているかの確認用） */
+    this.voiceStatusFailCount = 0;
+  }
+
+  /** 今そのVCに出ているステータス（最後に書いた値）。"" はクリア済み */
+  currentStatus(channelId = this.vcChannelId) {
+    return this.voiceStatusByChannel.get(channelId)?.at(-1) ?? null;
   }
 
   /** 今チャットに見えている本文（編集後の最新） */
@@ -145,30 +150,23 @@ export class StubGateway {
     return true;
   }
 
+  /**
+   * ⚠ 実体(gateway.js)と同じく、失敗しても**例外は投げず false を返す**。
+   *   フォールバック（VC名変更）は廃止したので、呼び出し側は false を見ても何もしない。
+   */
   async setVoiceStatus(channelId, status) {
-    if (this.voiceStatusDisabled) return false;
     if (this.failVoiceStatus) {
-      // 実装と同じく「一度だけ警告して以後スキップ」を再現する
-      this.voiceStatusDisabled = true;
-      this.voiceStatusWarnCount += 1;
+      this.voiceStatusFailCount += 1;
       return false;
     }
     this.voiceStatuses.push(status);
+    const history = this.voiceStatusByChannel.get(channelId) ?? [];
+    history.push(status);
+    this.voiceStatusByChannel.set(channelId, history);
     return true;
   }
 
-  async getChannelName() {
-    return this.channelName;
-  }
-
-  async setChannelName(channelId, name) {
-    if (this.failRename) {
-      // 実装側が握りつぶす（落ちない）ことの確認用。gateway実体も false を返す設計
-      this.renames.push(`RATE_LIMITED(${name})`);
-      return false;
-    }
-    this.channelName = name;
-    this.renames.push(name);
-    return true;
-  }
+  // ⚠ getChannelName / setChannelName は**意図的に存在しない**。
+  //   VC名の変更は廃止した（2026-09-22・本人の指示）。
+  //   もし実装側がこれらを呼べば TypeError で即座にテストが落ちる＝退行の検出器になる。
 }

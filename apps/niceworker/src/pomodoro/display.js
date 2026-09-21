@@ -1,13 +1,20 @@
-import { relativeTag as relative, timeTag as time } from '../utils/time.js';
+import { relativeTag as relative, timeTag as time, jstClock } from '../utils/time.js';
 
 /**
- * 「今どのフェーズか」をDiscord上に見せる係。3段構えで、上から順に試す。
+ * 「今どのフェーズか」をDiscord上に見せる係。表示は2か所だけ。
  *
  *   (a) 告知チャンネルのメッセージ1本  … <t:...:R> 付き。カウントダウンはDiscord任せ
- *   (b) VCチャンネルのステータス       … 権限/API次第。駄目なら一度警告して以後スキップ
- *   (c) VCチャンネル名の変更           … (b)が使えないときだけ。レート制限に当たったら黙って諦める
+ *   (b) VCチャンネルのステータス       … 「🍅 作業中 〜01:39」。空文字で消える
  *
- * (b)(c) はどちらも「失敗しても機能全体を止めない」。ポモドーロ本体（ミュート制御）は
+ * ⚠ **VCチャンネル名は変更しない**（本人の指示・2026-09-22）。
+ *   以前は (b) が失敗したときのフォールバックとして改名する案があったが、
+ *   ・戻し損ねるとサーバーのチャンネル名が壊れたまま残る
+ *   ・10分に2回というレート制限がある
+ *   の2点が割に合わない。ステータスが出せなかったときは**警告ログだけ**にして、
+ *   残り時間は告知メッセージの <t:...:R> に任せる。実用上それで困らない。
+ *   → `gateway` に改名用のメソッドは存在しない。足さないこと。
+ *
+ * (b) は「失敗しても機能全体を止めない」。ポモドーロ本体（ミュート制御）は
  * 表示に一切依存させない。
  *
  * ⚠ 告知は「1ポモドーロにつき1メッセージ」。
@@ -17,14 +24,10 @@ import { relativeTag as relative, timeTag as time } from '../utils/time.js';
  *   編集に失敗したら（メッセージが消された等）新規投稿に落として機能は止めない。
  */
 export class PhaseDisplay {
-  constructor({ gateway, vcChannelId, labels, logger }) {
+  constructor({ gateway, vcChannelId, logger }) {
     this.gateway = gateway;
     this.vcChannelId = vcChannelId;
-    this.labels = labels; // { work, break } — VC名に使う文字列
     this.logger = logger;
-    /** VC名を戻すために、最初に見た名前を覚えておく */
-    this.originalName = null;
-    this.renameActive = false;
     /** 今のポモドーロで使い回している告知メッセージのID。終了したら手放す */
     this.liveMessageId = null;
   }
@@ -48,14 +51,32 @@ export class PhaseDisplay {
       : '';
 
     await this.#publish(`${heading}\n${body}${footer}${caveat}`);
-    await this.#applyChannelIndicator(isWork ? '🍅 作業中' : '☕ 休憩中', isWork ? this.labels.work : this.labels.break);
+    // 「状態の右に何時に終了か」を出す。ステータスは残り時間を自動で数えてくれないので、
+    // 相対ではなく**終了時刻**を書く（1分ごとに書き換えるのは論外。APIを無駄に叩くだけ）
+    await this.setStatus(`${isWork ? '🍅 作業中' : '☕ 休憩中'} 〜${jstClock(endsAt)}`);
   }
 
   async showFinished(reason) {
     // 最後の1回も編集で済ませる。終わったらメッセージを手放し、次のポモドーロは新しい1本を立てる
     await this.#publish(`## ✅ ポモドーロを終了しました\n${reason}\nおつかれさまでした！`);
     this.liveMessageId = null;
-    await this.#clearChannelIndicator();
+    await this.clearStatus();
+  }
+
+  /**
+   * VCステータスを書く。**ここが唯一のVC側への書き込み**。
+   * 失敗しても false が返るだけで例外は投げない（gateway側で握って警告ログを出す）。
+   */
+  async setStatus(text) {
+    return this.gateway.setVoiceStatus(this.vcChannelId, text);
+  }
+
+  /**
+   * ステータスを消す。空文字を入れるとDiscord側の表示が消える（実測204）。
+   * ポモドーロ終了・SIGTERM・起動時（前回の残骸の掃除）から呼ぶ。
+   */
+  async clearStatus() {
+    return this.gateway.setVoiceStatus(this.vcChannelId, '');
   }
 
   /**
@@ -82,28 +103,5 @@ export class PhaseDisplay {
       + '`` ' + String(detail).slice(0, 300) + ' ``\n'
       + 'お手数ですが、サーバー設定からミュートを解除してください。',
     );
-  }
-
-  async #applyChannelIndicator(statusText, fallbackName) {
-    const ok = await this.gateway.setVoiceStatus(this.vcChannelId, statusText);
-    if (ok) return;
-
-    // ここから先はフォールバック。元の名前を1回だけ控える
-    if (this.originalName === null) {
-      this.originalName = await this.gateway.getChannelName(this.vcChannelId);
-    }
-    const renamed = await this.gateway.setChannelName(this.vcChannelId, fallbackName);
-    if (renamed) this.renameActive = true;
-  }
-
-  async #clearChannelIndicator() {
-    // ステータスは空文字でクリアできる
-    await this.gateway.setVoiceStatus(this.vcChannelId, '');
-
-    if (this.renameActive && this.originalName) {
-      const restored = await this.gateway.setChannelName(this.vcChannelId, this.originalName);
-      if (restored) this.renameActive = false;
-      else this.logger.warn('[Display] VC名を元に戻せませんでした（レート制限の可能性。次回の終了時に再試行します）');
-    }
   }
 }

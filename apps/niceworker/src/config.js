@@ -46,9 +46,9 @@ export const config = {
   pomodoro: {
     workMinutes: readMinutes('WORK_MINUTES', 25),
     breakMinutes: readMinutes('BREAK_MINUTES', 5),
-    // VC名フォールバック用のラベル。改名はレート制限が厳しいので短く保つ
-    workChannelName: process.env.WORK_CHANNEL_NAME || '🍅作業中',
-    breakChannelName: process.env.BREAK_CHANNEL_NAME || '☕休憩中',
+    // ⚠ 以前あった WORK_CHANNEL_NAME / BREAK_CHANNEL_NAME は廃止した。
+    //   VC名の変更をやめ、表示はVCステータスだけにしたため（2026-09-22・本人の指示）。
+    //   .env に残っていても無視されるだけで害は無い
   },
 
   // --- State ---

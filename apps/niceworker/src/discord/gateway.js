@@ -30,9 +30,9 @@ export class DiscordGateway {
     this.client = client;
     this.guildId = guildId;
     this.announceChannelId = announceChannelId;
-    // VCステータスAPIは専用権限(SET_VOICE_CHANNEL_STATUS)が要る上、
-    // discord.jsのバージョンによっては未対応。失敗したら一度だけ警告して以後黙って諦める
-    this.voiceStatusDisabled = false;
+    // VCステータスAPIが連続で失敗しているか。同じ警告をログに並べないためだけのフラグで、
+    // 「以後あきらめる」ためのものではない（毎回ちゃんと試す）
+    this.voiceStatusFailing = false;
   }
 
   async #guild() {
@@ -124,46 +124,44 @@ export class DiscordGateway {
 
   /**
    * VC名の下に出る「ステータス」。discord.js に専用メソッドが無いので REST を直接叩く。
+   *
+   * ⚠ ここが唯一の「VC側の表示」手段。**VC名は絶対に変更しない**（本人の指示）。
+   *   チャンネル名を書き換える実装は、戻し損ねるとサーバーの名前が壊れたまま残るうえ
+   *   10分2回のレート制限にも当たる。ステータスにはその制限が無く、空文字で消せる。
+   *
+   * 実測（2026-09-22・本番トークン）:
+   *   PUT /channels/{id}/voice-status  → 204
+   *   GET /channels/{id}               → status は null で返る（**読み返せない**）
+   *   そのため「今なにが出ているか」を問い合わせる実装にはしない。書くだけ。
+   *
+   * 失敗しても機能は止めない。残り時間は告知メッセージの <t:...:R> 側で分かるため、
+   * ステータスが出せなくても実用上は困らない。
+   *
+   * @param {string} status 空文字 "" を渡すとステータスが消える
    * @returns {Promise<boolean>} 成功したか
    */
   async setVoiceStatus(channelId, status) {
-    if (this.voiceStatusDisabled) return false;
-
     try {
       await this.client.rest.put(`/channels/${channelId}/voice-status`, {
-        body: { status: status.slice(0, 500) },
+        body: { status: String(status ?? '').slice(0, 500) },
       });
+      if (this.voiceStatusFailing) {
+        this.voiceStatusFailing = false;
+        logger.info('[Gateway] VCステータスの設定が復旧しました');
+      }
       return true;
     } catch (error) {
-      // 権限不足・API未対応など理由は色々あるが、どれも機能全体を止める理由にはならない。
-      // うるさくならないよう一度だけ警告して、以後はVC名変更にフォールバックする
-      this.voiceStatusDisabled = true;
-      logger.warn(
-        `[Gateway] VCステータスを設定できませんでした（以後スキップしVC名変更に切り替えます）: ${error?.message ?? error}`,
-      );
-      return false;
-    }
-  }
-
-  async getChannelName(channelId) {
-    const channel = await this.#channel(channelId);
-    return channel?.name ?? null;
-  }
-
-  /**
-   * VC名の変更。10分に2回までのレート制限があり、当たると待たされる。
-   * 落とす価値はないので黙って諦める（既存の告知メッセージで残り時間は分かる）。
-   * @returns {Promise<boolean>} 成功したか
-   */
-  async setChannelName(channelId, name) {
-    try {
-      const channel = await this.#channel(channelId);
-      // レート制限に当たったとき discord.js は既定で待ち続けてしまうため、
-      // 待ち時間が長いリクエストはこちら側で打ち切る
-      await channel.setName(name);
-      return true;
-    } catch (error) {
-      logger.warn(`[Gateway] VC名を変更できませんでした（スキップします）: ${error?.message ?? error}`);
+      // 権限不足・API未対応・一時的な通信エラーなど理由は色々あるが、どれも機能全体を
+      // 止める理由にはならない。一時的な失敗のために恒久的に諦めることもしない
+      // （以前は一度失敗すると二度と試さない作りだった）。
+      // ただし25分ごとに同じ警告が並ぶとログが読めなくなるので、連続失敗は1回だけ出す。
+      if (!this.voiceStatusFailing) {
+        this.voiceStatusFailing = true;
+        logger.warn(
+          '[Gateway] VCステータスを設定できませんでした（表示だけの機能なので処理は続けます。'
+          + `復旧するまで同じ警告は繰り返しません）: ${error?.message ?? error}`,
+        );
+      }
       return false;
     }
   }

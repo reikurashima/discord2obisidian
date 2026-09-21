@@ -42,9 +42,7 @@ gateway.setMute = async (userId, mute, reason) => {
 };
 
 const registry = new MuteRegistry(statePath, logger);
-const display = new PhaseDisplay({
-  gateway, vcChannelId: VC, labels: { work: '🍅作業中', break: '☕休憩中' }, logger,
-});
+const display = new PhaseDisplay({ gateway, vcChannelId: VC, logger });
 const pomodoro = new PomodoroManager({
   gateway, registry, display, logger,
   vcChannelId: VC, workMs: 60_000, breakMs: 10_000,
@@ -58,6 +56,9 @@ async function shutdown(exitCode) {
   console.log('SHUTDOWN_START');
   await pomodoro.shutdownUnmuteAll();
   console.log(`SERVER_MUTED_AFTER_SHUTDOWN=${JSON.stringify([...gateway.serverMuted])}`);
+  // index.js と同じく、ミュート解除の**あと**に表示の後始末をする
+  await display.clearStatus();
+  console.log(`VOICE_STATUS_AFTER_SHUTDOWN=${JSON.stringify(gateway.currentStatus(VC))}`);
   console.log('SHUTDOWN_DONE');
   process.exit(exitCode);
 }
@@ -67,6 +68,9 @@ process.on('SIGINT', () => shutdown(0));
 async function main() {
   if (mode === 'recover' || mode === 'rejoin') {
     await pomodoro.recoverOnStartup();
+    // index.js と同じく、起動時に前回の残骸ステータスを消す
+    await display.clearStatus();
+    console.log(`VOICE_STATUS_AFTER_RECOVER=${JSON.stringify(gateway.currentStatus(VC))}`);
     console.log(`SERVER_MUTED_AFTER_RECOVER=${JSON.stringify([...gateway.serverMuted])}`);
     console.log(`REGISTRY_AFTER_RECOVER=${JSON.stringify(registry.list())}`);
     console.log(`PENDING_AFTER_RECOVER=${JSON.stringify(registry.pendingList())}`);
@@ -89,6 +93,7 @@ async function main() {
     await pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: null, newChannelId: VC });
   }
   console.log(`SERVER_MUTED=${JSON.stringify([...gateway.serverMuted])}`);
+  console.log(`VOICE_STATUS=${JSON.stringify(gateway.currentStatus(VC))}`);
   console.log('READY');
 
   if (mode === 'crash') {

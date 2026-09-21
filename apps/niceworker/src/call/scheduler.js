@@ -1,4 +1,4 @@
-import { relativeTag, timeTag, formatLocal } from '../utils/time.js';
+import { relativeTag, timeTag, formatLocal, jstClock } from '../utils/time.js';
 
 // 事前告知のタイミング。ここを増やしても実装は変えなくてよい
 const WARN_OFFSETS_MS = [5 * 60 * 1000, 60 * 1000];
@@ -6,6 +6,12 @@ const WARN_OFFSETS_MS = [5 * 60 * 1000, 60 * 1000];
 /**
  * 通話の終了予約（`/call end-at`）。
  * 予約は同時に1件だけ。オーナー専用コマンドなので取り合いは起きない。
+ *
+ * 対象VCには「⏰ 23:00 に終了」というステータスを出す。告知メッセージより目立ち、
+ * あとから通話に入ってきた人にも一目で伝わるため。
+ *
+ * ⚠ **チャンネル名は変更しない**（本人の指示・2026-09-22）。ステータスのみ。
+ *   改名は戻し損ねるとサーバーの名前が壊れたまま残るうえ、10分2回の制限がある。
  */
 export class CallScheduler {
   constructor({ gateway, logger, timers = { setTimeout, clearTimeout }, now = () => Date.now() }) {
@@ -17,6 +23,29 @@ export class CallScheduler {
     /** @type {{channelId: string, endsAt: number, requestedBy: string}|null} */
     this.reservation = null;
     this.timerIds = [];
+
+    // schedule()/cancel() は同期に値を返す（呼び出し側の作りを変えないため）が、
+    // ステータス更新は非同期。順番が入れ替わると「消してから書く」になって
+    // 消えないので、1本の鎖に直列化して必ず投げた順に流す。
+    this.statusQueue = Promise.resolve();
+  }
+
+  /** ステータス更新を直列化する。失敗しても本体は止めない */
+  #enqueueStatus(channelId, text) {
+    this.statusQueue = this.statusQueue.then(async () => {
+      try {
+        await this.gateway.setVoiceStatus(channelId, text);
+      } catch (error) {
+        // gateway 側で握っている想定だが、二重の保険（表示のために予約を壊さない）
+        this.logger.warn(`[Call] VCステータスを更新できませんでした: ${error?.message ?? error}`);
+      }
+    });
+    return this.statusQueue;
+  }
+
+  /** テスト・終了処理用。積んだステータス更新が全部流れるまで待つ */
+  async settled() {
+    await this.statusQueue;
   }
 
   /**
@@ -46,15 +75,21 @@ export class CallScheduler {
       });
     }, remaining));
 
+    // 「◯◯時に終了」を対象VCのステータスに出す。時刻は必ずJST（TZ設定に依存させない）
+    this.#enqueueStatus(channelId, `⏰ ${jstClock(endsAt)} に終了`);
+
     this.logger.info(`[Call] 終了予約: ${formatLocal(endsAt)} (VC: ${channelId}, 依頼: ${requestedBy})`);
     return { ok: true, endsAt };
   }
 
   cancel({ silent = false } = {}) {
     const had = this.reservation !== null;
+    const channelId = this.reservation?.channelId ?? null;
     for (const id of this.timerIds) this.timers.clearTimeout(id);
     this.timerIds = [];
     this.reservation = null;
+    // 予約が消えたらステータスも消す。残しておくと「23時終了」と嘘が出たままになる
+    if (channelId) this.#enqueueStatus(channelId, '');
     if (had && !silent) this.logger.info('[Call] 終了予約を取り消しました');
     return had;
   }

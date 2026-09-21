@@ -63,6 +63,8 @@ async function main() {
     check('接続中のaliceは解除される', /SERVER_MUTED_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
     check('⚠ 未接続のbobは台帳に残る', /REGISTRY_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
     check('bobが解除待ちとして保持される', /PENDING_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
+    check('起動時に前回のVCステータスを消しにいく', /VOICE_STATUS_AFTER_RECOVER=""/.test(recovered.out),
+      recovered.out.match(/VOICE_STATUS_AFTER_RECOVER=.*/)?.[0] ?? '(無し)');
 
     console.log('\n=== A-2. もう一度再起動しても解除待ちは失われない → 入室で解消 ===');
     // 誰もVCに繋がっていない状態で起動（＝今は誰も解除できない）
@@ -95,6 +97,12 @@ async function main() {
     check('SIGTERMで終了処理が走る', /SHUTDOWN_START/.test(term.out));
     check('全員解除してから終了', /SERVER_MUTED_AFTER_SHUTDOWN=\[\]/.test(term.out));
     check('解除→終了の順である', term.out.indexOf('SERVER_MUTED_AFTER_SHUTDOWN') < term.out.indexOf('SHUTDOWN_DONE'));
+    // ★ 表示の後始末: 作業中は終了時刻つきのステータスが出ており、SIGTERMで空になる
+    check('作業中はステータスに終了時刻が出ている',
+      /VOICE_STATUS="🍅 作業中 〜\d{2}:\d{2}"/.test(term.out),
+      term.out.match(/VOICE_STATUS=.*/)?.[0] ?? '(無し)');
+    check('SIGTERMでVCステータスが空になる', /VOICE_STATUS_AFTER_SHUTDOWN=""/.test(term.out),
+      term.out.match(/VOICE_STATUS_AFTER_SHUTDOWN=.*/)?.[0] ?? '(無し)');
     check('終了コード0', term.code === 0, `exit=${term.code} signal=${term.signal}`);
 
     const leftover = JSON.parse(fs.readFileSync(path.join(stateDir2, 'muted-members.json'), 'utf-8'));

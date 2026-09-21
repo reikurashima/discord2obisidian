@@ -9,13 +9,14 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import assert from 'assert';
+import { fileURLToPath } from 'url';
 
 import { FakeClock, StubGateway, createLogger } from './stubs.js';
 import { MuteRegistry } from '../src/pomodoro/muteRegistry.js';
 import { PhaseDisplay } from '../src/pomodoro/display.js';
 import { PomodoroManager } from '../src/pomodoro/manager.js';
 import { CallScheduler } from '../src/call/scheduler.js';
-import { parseEndTime, unixSeconds, relativeTag, formatLocal } from '../src/utils/time.js';
+import { parseEndTime, unixSeconds, relativeTag, formatLocal, jstClock } from '../src/utils/time.js';
 
 const VC = 'vc-pomodoro';
 const WORK_MS = 25 * 60 * 1000;
@@ -40,9 +41,7 @@ function check(label, condition, detail = '') {
 function buildHarness({ clock, statePath, logger }) {
   const gateway = new StubGateway({ vcChannelId: VC });
   const registry = new MuteRegistry(statePath, logger);
-  const display = new PhaseDisplay({
-    gateway, vcChannelId: VC, labels: { work: '🍅作業中', break: '☕休憩中' }, logger,
-  });
+  const display = new PhaseDisplay({ gateway, vcChannelId: VC, logger });
   const pomodoro = new PomodoroManager({
     gateway, registry, display, logger,
     vcChannelId: VC, workMs: WORK_MS, breakMs: BREAK_MS,
@@ -77,6 +76,9 @@ async function scenarioBasicCycle() {
   await join(h, 'alice');
   check('入室で作業フェーズが始まる', h.pomodoro.phase === 'work', `phase=${h.pomodoro.phase}`);
   check('aliceがサーバーミュートされる', h.gateway.serverMuted.has('alice'));
+  // ★ 今回の追加: 状態の右に「何時に終了か」が出る（20:00開始 + 25分 = 20:25）
+  check('VCステータスに作業の終了時刻が入る', h.gateway.currentStatus() === '🍅 作業中 〜20:25',
+    `status=${JSON.stringify(h.gateway.currentStatus())}`);
   check('告知に <t:...:R> が入っている', /<t:\d+:R>/.test(h.gateway.announcements[0]));
   check('仕様の注意書きが1行入っている',
     h.gateway.announcements[0].includes('作業中に抜けるとミュートが残ります')
@@ -85,6 +87,8 @@ async function scenarioBasicCycle() {
 
   await clock.advance(WORK_MS);
   check('25分後に休憩へ', h.pomodoro.phase === 'break', `phase=${h.pomodoro.phase}`);
+  check('VCステータスに休憩の終了時刻が入る', h.gateway.currentStatus() === '☕ 休憩中 〜20:30',
+    `status=${JSON.stringify(h.gateway.currentStatus())}`);
   check('休憩でミュート解除', h.gateway.serverMuted.size === 0, `muted=${[...h.gateway.serverMuted]}`);
   check('台帳も空になる', h.registry.size === 0);
   check('休憩の解除が「成功」としてログに出る',
@@ -111,6 +115,17 @@ async function scenarioBasicCycle() {
   check('5セット目になっている', h.pomodoro.cycle === 5, `cycle=${h.pomodoro.cycle}`);
   console.log(`    チャットに見えるメッセージ: ${h.gateway.messages.size}本 / 編集 ${h.gateway.edits.length}回`);
   console.log(`    VCステータス履歴: ${JSON.stringify(h.gateway.voiceStatuses)}`);
+
+  // ★ ステータスは「フェーズが変わったときだけ」書く。
+  //   120分ぶん時間を進めても書き込みは9回（= 作業5 + 休憩4）。1分ごとの更新はしない
+  //   （もし毎分更新していたら120回になる）
+  check('ステータス更新はフェーズ切替時のみ（120分で9回）',
+    h.gateway.voiceStatuses.length === 9,
+    `${h.gateway.voiceStatuses.length}回 / 経過120分（毎分更新なら120回になるはず）`);
+  check('全ステータスに終了時刻が入っている',
+    h.gateway.voiceStatuses.every((s) => /^(🍅 作業中|☕ 休憩中) 〜\d{2}:\d{2}$/.test(s)));
+  check('ステータスが1分ごとに更新されていない（残り時間の文字列が無い）',
+    !h.gateway.voiceStatuses.some((s) => /残り|あと/.test(s)));
 }
 
 async function scenarioEditFallback() {
@@ -232,6 +247,9 @@ async function scenarioEmptyVc() {
   check('2人とも解除待ちで保持される', h.registry.pendingSize === 2, `pending=${h.registry.pendingList()}`);
   check('ミュートはまだ残っている（解除不能なので当然）', h.gateway.serverMuted.size === 2);
   check('終了の表示になる', h.gateway.liveTexts().some((m) => m.includes('終了しました')));
+  // ★ 終了したらステータスは空文字で消す（嘘の終了時刻を残さない）
+  check('終了でVCステータスが空になる', h.gateway.currentStatus() === '',
+    `status=${JSON.stringify(h.gateway.currentStatus())}`);
   check('終了も編集で済ませる（投稿は1本のまま）', h.gateway.announcements.length === 1,
     `新規投稿=${h.gateway.announcements.length}件 / 編集=${h.gateway.edits.length}回`);
   check('終了告知に解除待ちを列挙しない（冗長なので削除）',
@@ -351,33 +369,40 @@ async function scenarioUnmuteFailure() {
   console.log(`    告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
 }
 
-async function scenarioDisplayFallback() {
-  section('9. VCステータス失敗 → VC名変更にフォールバック / レート制限でも落ちない');
+async function scenarioStatusFailure() {
+  section('9. VCステータスAPIが失敗しても、警告だけで機能は止まらない（改名フォールバックは無い）');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'display.json'), logger });
+  // ⚠ スタブには setChannelName / getChannelName が存在しない。
+  //   実装が改名にフォールバックしようとすれば、ここで TypeError になって落ちる
   h.gateway.failVoiceStatus = true;
 
-  await join(h, 'alice');
-  check('VC名が 🍅作業中 に変わる', h.gateway.renames.at(-1) === '🍅作業中', `renames=${JSON.stringify(h.gateway.renames)}`);
-  check('ステータスAPIの警告は1回だけ', h.gateway.voiceStatusWarnCount === 1);
-
-  await clock.advance(WORK_MS);
-  check('休憩で ☕休憩中 に変わる', h.gateway.renames.at(-1) === '☕休憩中', `renames=${JSON.stringify(h.gateway.renames)}`);
-  check('ステータスAPIは再試行しない', h.gateway.voiceStatusWarnCount === 1);
-
-  // ここからレート制限を再現
-  h.gateway.failRename = true;
   let threw = false;
   try {
+    await join(h, 'alice');
+    await clock.advance(WORK_MS);
     await clock.advance(BREAK_MS);
-  } catch {
+  } catch (error) {
     threw = true;
+    console.log(`    例外: ${error?.message ?? error}`);
   }
-  check('改名がレート制限でも例外で落ちない', !threw);
-  check('作業フェーズには正常に進む', h.pomodoro.phase === 'work', `phase=${h.pomodoro.phase}`);
-  check('ミュートは通常どおり効く', h.gateway.serverMuted.has('alice'));
-  console.log(`    改名履歴: ${JSON.stringify(h.gateway.renames)}`);
+
+  check('ステータス失敗でも例外で落ちない', !threw);
+  check('改名にフォールバックしない（gatewayに改名APIが無くても動く）',
+    typeof h.gateway.setChannelName === 'undefined');
+  check('フェーズ遷移は通常どおり進む', h.pomodoro.phase === 'work', `phase=${h.pomodoro.phase}`);
+  check('ミュート制御は通常どおり効く', h.gateway.serverMuted.has('alice'));
+  check('告知メッセージ（<t:...:R>）は出ている', /<t:\d+:R>/.test(h.gateway.liveTexts()[0] ?? ''));
+  check('失敗しても毎回ちゃんと試している（諦めない）', h.gateway.voiceStatusFailCount >= 3,
+    `失敗 ${h.gateway.voiceStatusFailCount}回`);
+  console.log(`    ステータス書き込み成功: ${h.gateway.voiceStatuses.length}件 / 失敗: ${h.gateway.voiceStatusFailCount}件`);
+
+  // 復旧したら、次のフェーズからちゃんと出る
+  h.gateway.failVoiceStatus = false;
+  await clock.advance(WORK_MS);
+  check('復旧後はステータスが出る', /^☕ 休憩中 〜\d{2}:\d{2}$/.test(h.gateway.currentStatus() ?? ''),
+    `status=${JSON.stringify(h.gateway.currentStatus())}`);
 }
 
 async function scenarioCallEndAt() {
@@ -395,24 +420,103 @@ async function scenarioCallEndAt() {
   const result = scheduler.schedule({ channelId: 'vc-talk', endsAt: parsed.at, requestedBy: 'owner' });
   check('予約できる', result.ok);
 
-  await clock.advance(3 * 60 * 60 * 1000 - 5 * 60 * 1000); // 20:00 → 22:55
+  // ★ 今回の追加: 予約したら対象VCのステータスに終了時刻が出る
+  await scheduler.settled();
+  check('予約でVCステータスに終了時刻が入る',
+    gateway.currentStatus('vc-talk') === `⏰ ${jstClock(parsed.at)} に終了`,
+    `status=${JSON.stringify(gateway.currentStatus('vc-talk'))}`);
+
+  // ⚠ 残り時間から逆算して進める。`parseEndTime` はローカルTZ依存なので
+  //   「20:00 → 22:55」と決め打ちにすると TZ=UTC で走らせたとき破綻する
+  const untilEnd = parsed.at - clock.now();
+  await clock.advance(untilEnd - 5 * 60 * 1000); // 終了5分前
   check('5分前告知', gateway.announcements.some((m) => m.includes('あと5分')), gateway.announcements.at(-1));
 
-  await clock.advance(4 * 60 * 1000); // 22:59
+  await clock.advance(4 * 60 * 1000); // 終了1分前
   check('1分前告知', gateway.announcements.some((m) => m.includes('あと1分')), gateway.announcements.at(-1));
 
+  check('5分前・1分前ではステータスを書き換えない（無駄に叩かない）',
+    gateway.voiceStatusByChannel.get('vc-talk').length === 1,
+    `書き込み=${JSON.stringify(gateway.voiceStatusByChannel.get('vc-talk'))}`);
+
   await clock.advance(60 * 1000); // 23:00
+  await scheduler.settled();
   check('全員切断される', gateway.disconnected.length === 2, `disconnected=${gateway.disconnected}`);
   check('終了告知が出る', gateway.announcements.at(-1).includes('通話を終了しました'));
+  check('★ 時刻が来たらVCステータスが空になる', gateway.currentStatus('vc-talk') === '',
+    `status=${JSON.stringify(gateway.currentStatus('vc-talk'))}`);
   console.log(`    ${gateway.announcements.map((m) => m.split('\n')[0]).join(' | ')}`);
+  console.log(`    vc-talk のステータス履歴: ${JSON.stringify(gateway.voiceStatusByChannel.get('vc-talk'))}`);
 
   // cancel
   const scheduler2 = new CallScheduler({ gateway, logger, timers: clock.timerApi, now: clock.now });
   scheduler2.schedule({ channelId: 'vc-talk', endsAt: clock.now() + 30 * 60 * 1000, requestedBy: 'owner' });
+  await scheduler2.settled();
+  check('再予約でまたステータスが出る', /^⏰ \d{2}:\d{2} に終了$/.test(gateway.currentStatus('vc-talk')),
+    `status=${JSON.stringify(gateway.currentStatus('vc-talk'))}`);
+
   check('cancelで予約が消える', scheduler2.cancel() === true && scheduler2.reservation === null);
+  await scheduler2.settled();
+  check('★ 取り消しでVCステータスが空になる', gateway.currentStatus('vc-talk') === '',
+    `status=${JSON.stringify(gateway.currentStatus('vc-talk'))}`);
+
   const before = gateway.disconnected.length;
   await clock.advance(60 * 60 * 1000);
   check('取り消し後は切断されない', gateway.disconnected.length === before);
+
+  // SIGTERM 相当（index.js の shutdown は cancel({silent:true}) → settled() を通る）
+  const scheduler3 = new CallScheduler({ gateway, logger, timers: clock.timerApi, now: clock.now });
+  scheduler3.schedule({ channelId: 'vc-talk', endsAt: clock.now() + 30 * 60 * 1000, requestedBy: 'owner' });
+  await scheduler3.settled();
+  check('SIGTERM前はステータスが出ている', gateway.currentStatus('vc-talk') !== '');
+  scheduler3.cancel({ silent: true });
+  await scheduler3.settled();
+  check('★ SIGTERM（cancel silent）でもステータスが空になる', gateway.currentStatus('vc-talk') === '',
+    `status=${JSON.stringify(gateway.currentStatus('vc-talk'))}`);
+}
+
+function scenarioNoChannelRename() {
+  section('10-b. VC名を変更する経路がコード上に残っていないこと');
+  const srcDir = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'src');
+  const files = [];
+  const walk = (dir) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.js')) files.push(full);
+    }
+  };
+  walk(srcDir);
+
+  // ⚠ `.setName(` は discord.js の SlashCommandBuilder でも使う（commands.js）。
+  //   ひっかけないよう「チャンネルに対する改名」だけを狙い撃ちする。
+  //   コメント行は「改名しない」という説明そのものなので除外する。
+  const forbidden = [
+    [/\bchannel\s*(\?\.)?\.setName\s*\(/i, 'チャンネルの改名'],
+    [/\bsetChannelName\s*\(/, '旧gatewayの改名ラッパー'],
+    [/\bgetChannelName\s*\(/, '改名の前に元の名前を読む処理'],
+    [/\bPATCH\b.*\/channels\//, 'RESTでのチャンネル更新'],
+    [/\bWORK_CHANNEL_NAME\b/, '廃止した環境変数'],
+    [/\bBREAK_CHANNEL_NAME\b/, '廃止した環境変数'],
+  ];
+  const isComment = (line) => /^\s*(\/\/|\/\*|\*)/.test(line);
+
+  const hits = [];
+  for (const file of files) {
+    fs.readFileSync(file, 'utf-8').split(/\r?\n/).forEach((line, i) => {
+      if (isComment(line)) return;
+      for (const [re, why] of forbidden) {
+        if (re.test(line)) hits.push(`${path.basename(file)}:${i + 1} (${why}): ${line.trim()}`);
+      }
+    });
+  }
+  check(`src/ 配下 ${files.length}ファイルに改名の呼び出しが無い`, hits.length === 0,
+    hits.length ? `\n      ${hits.join('\n      ')}` : '検出0件');
+
+  // 逆に、ステータスAPIはちゃんと1か所だけ残っていること（消してしまう退行の検出）
+  const gatewaySrc = fs.readFileSync(path.join(srcDir, 'discord', 'gateway.js'), 'utf-8');
+  check('VCステータスAPI（PUT voice-status）は残っている',
+    /rest\.put\(`\/channels\/\$\{channelId\}\/voice-status`/.test(gatewaySrc));
 }
 
 function scenarioTimeParsing() {
@@ -441,6 +545,33 @@ function scenarioTimeParsing() {
   check('タグの形が正しい', relativeTag(at2300.at) === `<t:${expected}:R>`, relativeTag(at2300.at));
   // ミリ秒をそのまま入れる事故の検出（桁が3つ増えると西暦5万年台になる）
   check('秒であってミリ秒ではない', String(unixSeconds(at2300.at)).length === 10);
+}
+
+function scenarioJstClock() {
+  section('11-b. ステータスの HH:mm は TZ に依存せず必ずJST');
+
+  // 本人の要望どおりの例（深夜0時をまたぐケース）
+  const late = Date.parse('2026-09-23T01:39:00+09:00');
+  check('01:39 JST が "01:39" になる', jstClock(late) === '01:39', jstClock(late));
+  check('23:00 JST が "23:00" になる',
+    jstClock(Date.parse('2026-09-22T23:00:00+09:00')) === '23:00');
+  check('00:00 JST が "00:00" になる',
+    jstClock(Date.parse('2026-09-23T00:00:00+09:00')) === '00:00');
+
+  // ⚠ ここが本題。compose の TZ が効かずコンテナがUTCで動く事故は実際に起きている。
+  //   そのとき 01:39 が 16:39 と表示されては困るので、TZ を変えても結果が変わらないことを示す
+  const original = process.env.TZ;
+  const samples = [];
+  for (const tz of ['UTC', 'America/New_York', 'Asia/Tokyo']) {
+    process.env.TZ = tz;
+    samples.push(`${tz}=${jstClock(late)}`);
+  }
+  if (original === undefined) delete process.env.TZ; else process.env.TZ = original;
+
+  check('TZ を変えても表示が変わらない',
+    samples.every((s) => s.endsWith('=01:39')), samples.join(' / '));
+  check('後始末: TZ が元に戻っている', process.env.TZ === original,
+    `TZ=${process.env.TZ ?? '(未設定)'}`);
 }
 
 function scenarioStatusText() {
@@ -478,9 +609,11 @@ async function main() {
     await scenarioCrashRecovery();
     await scenarioSigterm();
     await scenarioUnmuteFailure();
-    await scenarioDisplayFallback();
+    await scenarioStatusFailure();
     await scenarioCallEndAt();
+    scenarioNoChannelRename();
     scenarioTimeParsing();
+    scenarioJstClock();
     await scenarioStatusText();
   } finally {
     // 後始末: 一時ディレクトリを消す

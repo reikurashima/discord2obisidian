@@ -23,10 +23,6 @@ const registry = new MuteRegistry(
 const display = new PhaseDisplay({
   gateway,
   vcChannelId: config.discord.pomodoroVcId,
-  labels: {
-    work: config.pomodoro.workChannelName,
-    break: config.pomodoro.breakChannelName,
-  },
   logger,
 });
 
@@ -54,6 +50,11 @@ discordClient.once('ready', async () => {
 
   // ⚠ 通常動作より先に、前回の取り残しを解除する
   await pomodoro.recoverOnStartup();
+
+  // 前回のプロセスが残したVCステータス（「🍅 作業中 〜01:39」等）を消す。
+  // VCが空ならDiscord側が勝手に消すこともあるが、明示的に消すほうが確実。
+  // 失敗しても起動は止めない（表示だけの話なので）
+  await display.clearStatus();
 
   await registerCommands({
     token: config.discord.token,
@@ -115,6 +116,7 @@ async function shutdown(exitCode) {
   shuttingDown = true;
 
   logger.info('Shutting down...');
+  // cancel() の中で対象VCのステータスも空に戻る（settled() で流し切るまで待つ）
   callScheduler.cancel({ silent: true });
 
   try {
@@ -124,6 +126,17 @@ async function shutdown(exitCode) {
     ]);
   } catch (error) {
     logger.error('Error while unmuting on shutdown', error);
+  }
+
+  // 表示の後始末。ミュート解除より優先度は低いので必ず後ろで、かつ短めの上限をつける
+  // （Dockerの猶予10秒を使い切ってSIGKILLされると、そもそも何も終わらない）
+  try {
+    await Promise.race([
+      Promise.all([display.clearStatus(), callScheduler.settled()]),
+      new Promise((resolve) => setTimeout(resolve, 1500)),
+    ]);
+  } catch (error) {
+    logger.error('Error while clearing voice status on shutdown', error);
   }
 
   try {
