@@ -1,0 +1,40 @@
+# ⚠ このファイルは apps/claude-runner/ 単独で完結している。
+#    リポジトリ直下の docker-compose.yaml（Obsidian保存Bot・本番稼働中）とは別物。
+#    起動は必ずこのディレクトリで:  cd apps/claude-runner && docker compose up -d --build
+#
+# ⚠ docker-compose.yml（.yaml でないほう）を作らないこと。
+#    両方あると .yml が優先され、こちらが黙って無視される（2026-09-21 に実際に事故った）。
+
+services:
+  claude-runner:
+    build: .
+    container_name: claude-runner
+    restart: unless-stopped
+    # .env が無くても起動できるようにしておく（必須の環境変数は無い設計）
+    env_file:
+      - .env
+    environment:
+      # ⚠ 未設定だとコンテナはUTCで動く。
+      #    ジョブIDの日時・health.json・ログが9時間ズレて障害調査が地獄になる。必ず入れる。
+      - TZ=Asia/Tokyo
+      # コンテナ内のパス。下の volumes の右辺と必ず一致させること
+      - QUEUE_DIR=/queue
+      - HEALTH_FILE=/queue/health.json
+      # ジョブごとの作業ディレクトリ。コンテナ内に閉じる（マウントしない）
+      - WORK_DIR=/work
+    logging:
+      # 既定の json-file はローテーションしないため、長期稼働でディスクを食い続ける
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # 左辺 = NAS本体(UGOS/Linux)上の実パス。
+      #   ⚠ 名前付きボリュームにしないこと。PM Bot / マイポータル（別コンテナ）が
+      #     同じ queue を読み書きするので、ホストから見える実パスである必要がある。
+      #     依頼側のコンテナにも同じ左辺をマウントすること。
+      #
+      # 認証情報（サブスクのログイン状態）。ここが残る限り再ログインは不要
+      - /volume1/docker/claude-runner/.claude:/root/.claude
+      # ジョブのやり取り。health.json も /queue の直下に出る
+      - /volume1/docker/claude-runner/queue:/queue

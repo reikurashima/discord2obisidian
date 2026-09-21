@@ -1,0 +1,12 @@
+{
+  "name": "claude-runner",
+  "version": "1.0.0",
+  "description": "NAS常駐ワーカー: キューに置かれたジョブを claude -p (ヘッドレス) で処理して結果を書き戻す",
+  "type": "module",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/run.mjs"
+  }
+}
