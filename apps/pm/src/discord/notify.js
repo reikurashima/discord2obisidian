@@ -26,6 +26,22 @@ export async function postToChannel(client, channelId, content, mentionUserIds =
   });
 }
 
+/**
+ * オーナーへのDM。
+ * ⚠ 失敗しても呼び出し側を止めない（DMを閉じている等で普通に失敗しうる）。
+ * @returns {Promise<boolean>} 送れたか
+ */
+export async function dmOwner(client, content) {
+  try {
+    const user = await client.users.fetch(config.ownerUserId);
+    await user.send({ content, allowedMentions: { parse: [], users: [] } });
+    return true;
+  } catch (error) {
+    logger.error('[Notify] Failed to DM the owner', error);
+    return false;
+  }
+}
+
 /** 通知の失敗でコマンド自体を失敗させたくない場面用（ログだけ残す） */
 export async function postQuietly(client, channelId, content, mentionUserIds = []) {
   try {

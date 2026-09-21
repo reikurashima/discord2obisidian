@@ -36,4 +36,64 @@ export const config = {
     // （期限を過ぎた未完了タスクはポータル側で赤字表示するので、Discordでは追撃しない）
     dueCatchUpWindowMs: 60 * 60 * 1000,
   },
+
+  // 毎日の会話走査（タスク候補の自動抽出）。
+  // ⚠ 既定は「無効」。SCAN_ENABLED=1 を明示したときだけ動く。
+  //    本番稼働中のBotに後から足す機能なので、.env を更新し忘れたままデプロイしても
+  //    今までどおりの動きのままになるほうが安全なため。
+  scan: {
+    enabled: process.env.SCAN_ENABLED === '1',
+
+    // JSTの何時に走らせるか。既存の1分ティックに相乗りするので cron は足さない
+    at: parseHHmmOrDefault(process.env.SCAN_AT, { hour: 9, minute: 0 }),
+
+    // 明示的に走査から外すチャンネル（カンマ区切り）
+    excludeChannelIds: csv(process.env.SCAN_EXCLUDE_CHANNEL_IDS),
+
+    // PM Bot の通知先チャンネル。
+    // ⚠ このBotは「タスクが登録されたチャンネル」へ通知を返す作りなので、
+    //    通知先＝案件チャンネルそのもの。そこを丸ごと除外すると走査の意味が無くなる。
+    //    フィードバックループは「Bot自身の投稿を読まない」で塞いであるので、
+    //    ここは "専用の通知チャンネルを作った場合の受け皿" として残してある。
+    notifyChannelIds: csv(process.env.SCAN_NOTIFY_CHANNEL_IDS),
+
+    // カーソルが無いチャンネルを初めて読むとき、何時間ぶんまで遡るか
+    firstRunHours: positiveInt(process.env.SCAN_FIRST_RUN_HOURS, 24),
+
+    // 1回の走査で1チャンネルから取る上限。超えたら新しい方を優先してカーソルは進める
+    maxMessagesPerChannel: positiveInt(process.env.SCAN_MAX_MESSAGES_PER_CHANNEL, 200),
+
+    // claude-runner のキュー（compose でマウントする）
+    runnerQueueDir: (process.env.RUNNER_QUEUE_DIR || '/runner-queue').replace(/[/\\]+$/, '') || '/runner-queue',
+    runnerModel: process.env.SCAN_RUNNER_MODEL || 'haiku',
+
+    // 結果待ちの上限。超えたら「今日は失敗」として記録し、翌日に持ち越さない
+    jobTimeoutMs: positiveInt(process.env.SCAN_JOB_TIMEOUT_MS, 10 * 60 * 1000),
+    jobPollIntervalMs: positiveInt(process.env.SCAN_JOB_POLL_INTERVAL_MS, 2000),
+
+    // DMに載せるポータルのURL（任意）
+    portalUrl: process.env.PORTAL_PM_URL || '',
+  },
 };
+
+function csv(value) {
+  return String(value || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s !== '');
+}
+
+function positiveInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** "HH:mm" を読む。壊れていても起動は止めない（走査の時刻は起動を諦めるほどの設定ではない） */
+function parseHHmmOrDefault(value, fallback) {
+  const m = String(value || '').trim().match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return fallback;
+  const hour = Number(m[1]);
+  const minute = Number(m[2]);
+  if (hour > 23 || minute > 59) return fallback;
+  return { hour, minute };
+}

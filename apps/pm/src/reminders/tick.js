@@ -87,7 +87,13 @@ function unmarkReminders(id, keys) {
   });
 }
 
-/** 起動時に1回走らせてから、以後1分ごと */
+/**
+ * 起動時に1回走らせてから、以後1分ごと。
+ *
+ * ⚠ 会話走査（scan/tick.js）もこの1本のループに相乗りさせる。
+ *    スケジューラを2本持つと、TZ設定や多重実行の事故を1つ増やすことになるため。
+ *    どちらが失敗しても、もう一方は止めない。
+ */
 export function startReminderLoop(client) {
   const tick = async () => {
     if (ticking) return; // 前のティックが長引いたら今回は見送る（多重実行させない）
@@ -96,6 +102,11 @@ export function startReminderLoop(client) {
       await runTick(client);
     } catch (error) {
       logger.error('[Reminder] Tick failed', error);
+    }
+    try {
+      await runScanTick(client);
+    } catch (error) {
+      logger.error('[Scan] Tick failed', error);
     } finally {
       ticking = false;
     }
@@ -104,6 +115,12 @@ export function startReminderLoop(client) {
   tick();
   timer = setInterval(tick, config.reminders.tickIntervalMs);
   logger.info(`[Reminder] Loop started (every ${config.reminders.tickIntervalMs / 1000}s)`);
+  if (config.scan.enabled) {
+    const { hour, minute } = config.scan.at;
+    logger.info(`[Scan] Enabled — 毎日 ${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')} (JST) に走査 / queue=${config.scan.runnerQueueDir}`);
+  } else {
+    logger.info('[Scan] Disabled (SCAN_ENABLED=1 で有効になります)');
+  }
   return timer;
 }
 

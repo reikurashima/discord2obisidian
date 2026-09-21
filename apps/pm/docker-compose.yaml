@@ -32,3 +32,8 @@ services:
       #   ポータル側にも同じ左辺をマウントすること。
       # 右辺 = コンテナ内のパス。上の STATE_DIR と必ず一致させること。
       - /volume1/docker/discordbot-pm/data:/data
+      # claude-runner のキュー。会話走査のジョブをここに置き、結果をここから読む。
+      #   ⚠ 右辺は .env の RUNNER_QUEUE_DIR と必ず一致させること。
+      #   ⚠ rw が必要（inbox に書き、result を読む）。
+      #   ⚠ claude-runner 側が同じ左辺をマウントしていること。
+      - /volume1/docker/claude-runner/queue:/runner-queue:rw
