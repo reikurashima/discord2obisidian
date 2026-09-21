@@ -1,0 +1,17 @@
+{
+  "name": "niceworker-bot",
+  "version": "1.0.0",
+  "description": "NiceWorker Bot: 自動ポモドーロ(サーバーミュート)と通話終了予約",
+  "private": true,
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/scenarios.js",
+    "check": "node scripts/syntax-check.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.0"
+  }
+}

@@ -1,0 +1,28 @@
+# ⚠ docker-compose.yml（.yml のほう）を作らないこと。
+#    両方あると .yml が優先して読まれ、このファイルの変更が無視される事故が起きる。
+services:
+  niceworker-bot:
+    build: .
+    container_name: niceworker-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # ⚠ 未設定だとコンテナはUTCで動く。/call end-at 23:00 が9時間ずれ、
+      #    ログの時刻も読めなくなる（既存Botで実際に事故った）
+      - TZ=Asia/Tokyo
+      # コンテナ内の保存先。左のボリュームのマウント先と必ず一致させること
+      - STATE_DIR=/data
+    logging:
+      # 既定の json-file はローテーションしないため、長期稼働でディスクを食い続ける
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # 「Botがミュートした人」の台帳。ここが消えると、クラッシュ時に
+      # ミュートされたまま取り残される人が出るので、必ず永続化する
+      - niceworker-state:/data
+
+volumes:
+  niceworker-state:

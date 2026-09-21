@@ -1,0 +1,34 @@
+# ⚠ このファイルは apps/pm/ 単独で完結している。
+#    リポジトリ直下の docker-compose.yaml（Obsidian保存Bot・本番稼働中）とは別物。
+#    起動は必ずこのディレクトリで:  cd apps/pm && docker compose up -d --build
+#
+# ⚠ docker-compose.yml（.yaml でないほう）を作らないこと。
+#    両方あると .yml が優先され、こちらが黙って無視される。
+
+services:
+  discord-pm-bot:
+    build: .
+    container_name: discord-pm-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # ⚠ 未設定だとコンテナはUTCで動く。
+      #    コード側は +09:00 固定で計算しているので期限判定は狂わないが、
+      #    ログの時刻が9時間ズレて障害調査が地獄になるので必ず入れる。
+      - TZ=Asia/Tokyo
+      # コンテナ内のパス。左辺のホストパスと対になる
+      - STATE_DIR=/data
+    logging:
+      # 既定の json-file はローテーションしないため、長期稼働でディスクを食い続ける
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      # 左辺 = NAS本体(UGOS/Linux)上の実パス。
+      #   ⚠ 名前付きボリュームにしないこと。マイポータル（別プロセス／別コンテナ）が
+      #     同じ .md を読み書きするので、ホストから見える実パスである必要がある。
+      #   ポータル側にも同じ左辺をマウントすること。
+      # 右辺 = コンテナ内のパス。上の STATE_DIR と必ず一致させること。
+      - /volume1/docker/discordbot-pm/data:/data

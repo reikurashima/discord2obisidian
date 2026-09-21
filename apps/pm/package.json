@@ -1,0 +1,16 @@
+{
+  "name": "discord-pm-bot",
+  "version": "1.0.0",
+  "description": "PM Bot for NiceCraft Production: owner-only task management over Discord slash commands",
+  "type": "module",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --import ./test/loader.mjs ./test/run.mjs"
+  },
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.0"
+  }
+}
