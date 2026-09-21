@@ -3,6 +3,7 @@ import { logger } from '../utils/logger.js';
 import { listOpenTasks, updateTask } from '../storage/tasks.js';
 import { REMINDER_KEYS, dueReminders } from './schedule.js';
 import { buildReminderMessage, postToChannel } from '../discord/notify.js';
+import { runScanTick } from '../scan/tick.js';
 
 // 1分ごとのティックで判定する。cron を足さないのは、
 // 依存が増えるうえ「コンテナのTZ設定次第で時刻がズレる」事故を1つ増やすため。
