@@ -47,7 +47,7 @@ async function main() {
   console.log(`state dir: ${stateDir}\n`);
 
   try {
-    console.log('=== A. クラッシュ → 再起動で自動解除 ===');
+    console.log('=== A. クラッシュ → 再起動（VC接続中の人は解除できる） ===');
     const crashed = await run('crash', stateDir);
     console.log(indent(crashed.out));
     check('異常終了している', crashed.code === 137, `exit=${crashed.code}`);
@@ -57,10 +57,27 @@ async function main() {
     const stillMuted = JSON.parse(fs.readFileSync(path.join(stateDir, 'server-mute-state.json'), 'utf-8'));
     check('Discord側はミュートされたまま', stillMuted.length === 2, JSON.stringify(stillMuted));
 
-    const recovered = await run('recover', stateDir);
+    // aliceだけVCに繋がったまま再起動したケース
+    const recovered = await run('recover', stateDir, { env: { CONNECTED: 'alice' } });
     console.log(indent(recovered.out));
-    check('再起動で全員解除', /SERVER_MUTED_AFTER_RECOVER=\[\]/.test(recovered.out));
-    check('台帳も空になる', /REGISTRY_AFTER_RECOVER=\[\]/.test(recovered.out));
+    check('接続中のaliceは解除される', /SERVER_MUTED_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
+    check('⚠ 未接続のbobは台帳に残る', /REGISTRY_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
+    check('bobが解除待ちとして保持される', /PENDING_AFTER_RECOVER=\["bob"\]/.test(recovered.out));
+
+    console.log('\n=== A-2. もう一度再起動しても解除待ちは失われない → 入室で解消 ===');
+    // 誰もVCに繋がっていない状態で起動（＝今は誰も解除できない）
+    const again = await run('recover', stateDir);
+    console.log(indent(again.out));
+    check('解除待ちが再起動をまたいで保持される', /PENDING_AFTER_RECOVER=\["bob"\]/.test(again.out));
+    check('ミュートはまだ残ったまま', /SERVER_MUTED_AFTER_RECOVER=\["bob"\]/.test(again.out));
+
+    const rejoined = await run('rejoin', stateDir);
+    console.log(indent(rejoined.out));
+    check('一般VCへの入室で解除される', /SERVER_MUTED_AFTER_REJOIN=\[\]/.test(rejoined.out));
+    check('解除待ちが空になる', /PENDING_AFTER_REJOIN=\[\]/.test(rejoined.out));
+
+    const finalLedger = JSON.parse(fs.readFileSync(path.join(stateDir, 'muted-members.json'), 'utf-8'));
+    check('台帳が空で終わる', finalLedger.muted.length === 0, JSON.stringify(finalLedger.muted));
 
     console.log('\n=== B. SIGTERM → 全解除してから終了 ===');
     const stateDir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'niceworker-lifecycle-'));

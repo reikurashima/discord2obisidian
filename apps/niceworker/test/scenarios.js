@@ -51,15 +51,18 @@ function buildHarness({ clock, statePath, logger }) {
   return { gateway, registry, display, pomodoro };
 }
 
-/** VCへの入室イベント（スタブの在室者も動かす） */
-async function join(h, userId) {
-  h.gateway.join(userId);
-  await h.pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: null, newChannelId: VC });
+/** VCへの入室イベント（スタブの接続状態も動かす） */
+async function join(h, userId, channelId = VC) {
+  const from = h.gateway.connections.get(userId) ?? null;
+  h.gateway.join(userId, channelId);
+  await h.pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: from, newChannelId: channelId });
 }
 
+/** VCから完全に切断する（以後この人への setMute は 40032 になる） */
 async function leave(h, userId) {
+  const from = h.gateway.connections.get(userId) ?? null;
   h.gateway.leave(userId);
-  await h.pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: VC, newChannelId: null });
+  await h.pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: from, newChannelId: null });
 }
 
 // ---------------------------------------------------------------------------
@@ -75,12 +78,20 @@ async function scenarioBasicCycle() {
   check('入室で作業フェーズが始まる', h.pomodoro.phase === 'work', `phase=${h.pomodoro.phase}`);
   check('aliceがサーバーミュートされる', h.gateway.serverMuted.has('alice'));
   check('告知に <t:...:R> が入っている', /<t:\d+:R>/.test(h.gateway.announcements[0]));
+  check('仕様の注意書きが1行入っている',
+    h.gateway.announcements[0].includes('作業中に抜けるとミュートが残ります')
+    && h.gateway.announcements[0].includes('次にVCに入ると自動で解除されます'));
   console.log(`    告知: ${h.gateway.announcements[0].replace(/\n/g, ' / ')}`);
 
   await clock.advance(WORK_MS);
   check('25分後に休憩へ', h.pomodoro.phase === 'break', `phase=${h.pomodoro.phase}`);
   check('休憩でミュート解除', h.gateway.serverMuted.size === 0, `muted=${[...h.gateway.serverMuted]}`);
   check('台帳も空になる', h.registry.size === 0);
+  check('休憩の解除が「成功」としてログに出る',
+    logger.lines.some((l) => l.includes('解除成功: alice') && l.includes('休憩開始')));
+  check('休憩の解除結果の内訳が出る',
+    logger.lines.some((l) => l.includes('休憩開始の解除結果') && l.includes('解除 1人')));
+  console.log(`    ${logger.lines.filter((l) => l.includes('休憩開始')).join('\n    ')}`);
   console.log(`    告知: ${h.gateway.announcements[1].replace(/\n/g, ' / ')}`);
 
   await clock.advance(BREAK_MS);
@@ -105,8 +116,8 @@ async function scenarioLateJoiner() {
   check('台帳に2人', h.registry.size === 2, `entries=${h.registry.list()}`);
 }
 
-async function scenarioLeaverUnmuted() {
-  section('3. 作業中に1人退出 → その人のミュートが解除される');
+async function scenarioLeaverPending() {
+  section('3. 作業中に1人が完全に退出 → 40032 で解除できず「解除待ち」として台帳に残る');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'leave.json'), logger });
@@ -116,14 +127,51 @@ async function scenarioLeaverUnmuted() {
   check('2人ともミュート', h.gateway.serverMuted.size === 2);
 
   await leave(h, 'bob');
-  check('bobのミュートが解除される', !h.gateway.serverMuted.has('bob'));
-  check('aliceはミュートのまま', h.gateway.serverMuted.has('alice'));
-  check('台帳からbobが消える', !h.registry.has('bob') && h.registry.has('alice'));
+  check('bobはミュートされたまま（Discord仕様で解除不可）', h.gateway.serverMuted.has('bob'));
+  check('⚠ 台帳から消えない', h.registry.has('bob'));
+  check('bobが解除待ちになる', h.registry.isPending('bob'), `pending=${h.registry.pendingList()}`);
+  check('aliceは解除待ちではない', !h.registry.isPending('alice'));
   check('ポモドーロは続行', h.pomodoro.phase === 'work');
+  check('40032のログが結果を明示している',
+    logger.lines.some((l) => l.includes('解除できませんでした: bob') && l.includes('40032')));
+  check('本人への案内が告知される', h.gateway.announcements.some((m) => m.includes('ミュートが残っています')));
+  console.log(`    ログ: ${logger.lines.find((l) => l.includes('解除できませんでした: bob'))}`);
+  console.log(`    告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
+
+  // ディスクにも解除待ちが載っていること（再起動しても失われない）
+  const onDisk = JSON.parse(fs.readFileSync(path.join(stateDir, 'leave.json'), 'utf-8'));
+  check('解除待ちがディスクに保存される',
+    onDisk.muted.find((m) => m.userId === 'bob')?.pendingUnmute === true,
+    JSON.stringify(onDisk.muted));
+
+  section('3-b. その人が別のVCに入る → 即座に解除され台帳から消える');
+  await join(h, 'bob', 'vc-zatsudan'); // ポモドーロ専用VCではない一般VC
+  check('bobのミュートが解除される', !h.gateway.serverMuted.has('bob'));
+  check('台帳から消える', !h.registry.has('bob'));
+  check('解除待ちが0件になる', h.registry.pendingSize === 0);
+  check('解除成功がログに出る', logger.lines.some((l) => l.includes('解除成功: bob')));
+  check('aliceは影響を受けない', h.gateway.serverMuted.has('alice') && h.registry.has('alice'));
+  console.log(`    ログ: ${logger.lines.filter((l) => l.includes('bob')).slice(-2).join(' / ')}`);
+}
+
+async function scenarioMoveToAnotherVc() {
+  section('4. 作業中に別のVCへ移動 → 接続が続いているのでその場で解除できる');
+  const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
+  const logger = createLogger();
+  const h = buildHarness({ clock, statePath: path.join(stateDir, 'move.json'), logger });
+
+  await join(h, 'alice');
+  await join(h, 'bob');
+  await join(h, 'bob', 'vc-zatsudan'); // 移動（切断していない）
+
+  check('bobのミュートはその場で解除される', !h.gateway.serverMuted.has('bob'));
+  check('解除待ちにはならない', !h.registry.has('bob'));
+  check('解除成功のログ', logger.lines.some((l) => l.includes('解除成功: bob') && l.includes('退出時の解除')));
+  console.log(`    ログ: ${logger.lines.find((l) => l.includes('解除成功: bob'))}`);
 }
 
 async function scenarioEmptyVc() {
-  section('4. 全員退出 → 終了して全解除');
+  section('5. 全員退出 → 終了。解除待ちとして保持され、再入室で解消される');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const statePath = path.join(stateDir, 'empty.json');
@@ -135,18 +183,26 @@ async function scenarioEmptyVc() {
   await leave(h, 'bob');
 
   check('idleに戻る', h.pomodoro.phase === 'idle', `phase=${h.pomodoro.phase}`);
-  check('誰もミュートされていない', h.gateway.serverMuted.size === 0);
-  check('台帳が空', h.registry.size === 0);
+  check('2人とも解除待ちで保持される', h.registry.pendingSize === 2, `pending=${h.registry.pendingList()}`);
+  check('ミュートはまだ残っている（解除不能なので当然）', h.gateway.serverMuted.size === 2);
   check('終了の告知が出る', h.gateway.announcements.some((m) => m.includes('終了しました')));
+  check('終了告知に解除待ちが明記される', h.gateway.announcements.at(-1).includes('次にVCに入ると自動で解除'));
+  console.log(`    最後の告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
 
   // 次のフェーズタイマーが残っていないこと（空のVCで勝手に再開しない）
   await clock.advance(WORK_MS * 2);
   check('空のまま時間が経っても再開しない', h.pomodoro.phase === 'idle');
-  console.log(`    最後の告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
+
+  // 2人が戻ってくる → 1人目の入室で新しいポモドーロが始まるが、解除待ちは解消される
+  await join(h, 'alice', 'vc-zatsudan');
+  check('aliceが一般VCに入ると解除される', !h.gateway.serverMuted.has('alice') && !h.registry.has('alice'));
+  await join(h, 'bob', 'vc-zatsudan');
+  check('bobも解除される', !h.gateway.serverMuted.has('bob') && !h.registry.has('bob'));
+  check('解除待ちが0件', h.registry.pendingSize === 0);
 }
 
 async function scenarioCrashRecovery() {
-  section('5. プロセスを落として再起動 → 記録に残っていた人が解除される');
+  section('6. プロセスを落として再起動 → 記録に残っていた人が解除される');
   const statePath = path.join(stateDir, 'crash.json');
   const clock1 = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger1 = createLogger();
@@ -162,21 +218,40 @@ async function scenarioCrashRecovery() {
     `muted=${onDisk.muted.map((m) => m.userId).join(',')}`);
   console.log(`    ${statePath}: ${JSON.stringify(onDisk.muted.map((m) => m.userId))}`);
 
-  // --- 再起動 ---
+  // --- 再起動(1): aliceはVCに残っている / bobは切断済み ---
   const clock2 = new FakeClock(Date.parse('2026-09-22T20:30:00+09:00'));
   const logger2 = createLogger();
   const h2 = buildHarness({ clock: clock2, statePath, logger: logger2 });
   // 新プロセスから見ても、2人はまだサーバーミュートされている状態を引き継ぐ
   h2.gateway.serverMuted = h1.gateway.serverMuted;
+  h2.gateway.join('alice'); // aliceだけVCに繋がったまま
 
   await h2.pomodoro.recoverOnStartup();
-  check('起動時に全員解除される', h2.gateway.serverMuted.size === 0, `muted=${[...h2.gateway.serverMuted]}`);
-  check('台帳も空になる', h2.registry.size === 0);
-  console.log(`    ${logger2.lines.filter((l) => l.includes('前回')).join(' / ')}`);
+  check('接続中のaliceは起動時に解除される', !h2.gateway.serverMuted.has('alice'));
+  check('未接続のbobは解除できない', h2.gateway.serverMuted.has('bob'));
+  check('⚠ bobは解除待ちとして保持される（消さない）',
+    h2.registry.has('bob') && h2.registry.isPending('bob'), `registry=${JSON.stringify(h2.registry.entries.get('bob'))}`);
+  check('内訳がログに出る', logger2.lines.some((l) => l.includes('起動時の解除結果')));
+  console.log(`    ${logger2.lines.filter((l) => l.includes('起動時') || l.includes('解除待ち')).join('\n    ')}`);
+
+  // --- 再起動(2): さらにもう一度落ちても、解除待ちは失われない ---
+  const clock3 = new FakeClock(Date.parse('2026-09-22T21:00:00+09:00'));
+  const logger3 = createLogger();
+  const h3 = buildHarness({ clock: clock3, statePath, logger: logger3 });
+  h3.gateway.serverMuted = h2.gateway.serverMuted;
+
+  await h3.pomodoro.recoverOnStartup();
+  check('2回目の再起動でも解除待ちが残る', h3.registry.isPending('bob'), `pending=${h3.registry.pendingList()}`);
+
+  // 再起動を挟んだあと、bobが一般VCに入る → 解除される
+  await join(h3, 'bob', 'vc-zatsudan');
+  check('再起動を挟んでも入室で解除される', !h3.gateway.serverMuted.has('bob'));
+  check('台帳から消える', !h3.registry.has('bob'));
+  console.log(`    ${logger3.lines.filter((l) => l.includes('bob')).slice(-2).join('\n    ')}`);
 }
 
 async function scenarioSigterm() {
-  section('6. SIGTERM → 全解除してから終了');
+  section('7. SIGTERM → 全解除してから終了');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'sigterm.json'), logger });
@@ -185,14 +260,17 @@ async function scenarioSigterm() {
   await join(h, 'bob');
   await h.pomodoro.shutdownUnmuteAll();
 
-  check('全員解除済み', h.gateway.serverMuted.size === 0);
+  check('全員解除済み（接続中なので成功する）', h.gateway.serverMuted.size === 0);
   check('台帳が空', h.registry.size === 0);
   check('タイマーが残っていない', h.pomodoro.timer === null);
-  console.log(`    ${logger.lines.filter((l) => l.includes('終了処理')).join(' / ')}`);
+  check('1人ずつの成功ログが出る',
+    logger.lines.filter((l) => l.includes('解除成功')).length === 2);
+  check('内訳のログが出る', logger.lines.some((l) => l.includes('終了処理の解除結果')));
+  console.log(`    ${logger.lines.filter((l) => l.includes('解除')).join('\n    ')}`);
 }
 
 async function scenarioUnmuteFailure() {
-  section('7. 解除に失敗したら告知が出る（黙って失敗しない）');
+  section('8. 解除に失敗したら告知が出る（黙って失敗しない）');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'fail.json'), logger });
@@ -204,14 +282,19 @@ async function scenarioUnmuteFailure() {
   await clock.advance(10 * 1000); // リトライ待ちを進める
   await pending;
 
+  check('3回リトライしている',
+    logger.lines.filter((l) => l.includes('解除失敗: alice')).length === 3,
+    logger.lines.filter((l) => l.includes('解除失敗: alice')).length + '回');
   check('解除失敗が告知される', h.gateway.announcements.some((m) => m.includes('ミュート解除に失敗')));
   check('台帳に残す（次回起動で再挑戦）', h.registry.has('alice'));
+  check('40032ではないので解除待ちにはしない', !h.registry.isPending('alice'));
   check('ERRORログが出ている', logger.lines.some((l) => l.startsWith('[ERROR]')));
+  console.log(`    ${logger.lines.filter((l) => l.includes('alice')).slice(-4).join('\n    ')}`);
   console.log(`    告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
 }
 
 async function scenarioDisplayFallback() {
-  section('8. VCステータス失敗 → VC名変更にフォールバック / レート制限でも落ちない');
+  section('9. VCステータス失敗 → VC名変更にフォールバック / レート制限でも落ちない');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'display.json'), logger });
@@ -240,7 +323,7 @@ async function scenarioDisplayFallback() {
 }
 
 async function scenarioCallEndAt() {
-  section('9. /call end-at の予約・告知・切断');
+  section('10. /call end-at の予約・告知・切断');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const gateway = new StubGateway({ vcChannelId: 'vc-talk' });
@@ -275,7 +358,7 @@ async function scenarioCallEndAt() {
 }
 
 function scenarioTimeParsing() {
-  section('10. 時刻パースと <t:...:R> のUNIX秒検算（JST）');
+  section('11. 時刻パースと <t:...:R> のUNIX秒検算（JST）');
   const base = Date.parse('2026-09-22T20:00:00+09:00');
   console.log(`    基準時刻: ${formatLocal(base)} (epoch ${base}) / TZ=${process.env.TZ ?? '(未設定)'}`);
 
@@ -303,16 +386,21 @@ function scenarioTimeParsing() {
 }
 
 function scenarioStatusText() {
-  section('11. /pomo status の文面');
+  section('12. /pomo status の文面');
   const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
   const logger = createLogger();
   const h = buildHarness({ clock, statePath: path.join(stateDir, 'status.json'), logger });
   console.log(`    停止中: ${h.pomodoro.statusText().replace(/\n/g, ' / ')}`);
   assert.ok(h.pomodoro.statusText().includes('停止中'));
-  return join(h, 'alice').then(() => {
+  return join(h, 'alice').then(async () => {
     const text = h.pomodoro.statusText();
     console.log(`    作業中: ${text.replace(/\n/g, ' / ')}`);
     check('残り時間がタイムスタンプ記法', /<t:\d{10}:R>/.test(text));
+
+    await leave(h, 'alice'); // 解除待ちが発生する
+    const pendingText = h.pomodoro.statusText();
+    console.log(`    解除待ちあり: ${pendingText.replace(/\n/g, ' / ')}`);
+    check('解除待ちが status に出る', pendingText.includes('解除待ち') && pendingText.includes('<@alice>'));
   });
 }
 
@@ -325,7 +413,8 @@ async function main() {
   try {
     await scenarioBasicCycle();
     await scenarioLateJoiner();
-    await scenarioLeaverUnmuted();
+    await scenarioLeaverPending();
+    await scenarioMoveToAnotherVc();
     await scenarioEmptyVc();
     await scenarioCrashRecovery();
     await scenarioSigterm();

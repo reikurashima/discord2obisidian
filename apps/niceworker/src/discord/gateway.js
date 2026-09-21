@@ -1,9 +1,20 @@
 import { logger } from '../utils/logger.js';
 
-// Discord側の「もう対象が存在しない／VCに居ない」系エラーコード。
-// 解除しようとした相手が既に居ないなら、ミュート状態も一緒に消えているので成功扱いでよい。
-// （10007 Unknown Member / 10013 Unknown User / 40032 Target user is not connected to voice）
-const GONE_CODES = new Set([10007, 10013, 40032]);
+// ⚠ 40032 "Target user is not connected to voice." を成功扱いにしてはいけない。
+//
+//    実機で確認した事実（2026-09-22）:
+//      PATCH /guilds/{guild}/members/{user} {"mute": false}
+//        → 400 {"code": 40032, "message": "Target user is not connected to voice."}
+//      このときミュートは解除されず、GET すると mute: true のまま残る。
+//
+//    以前は「対象が居ない＝ミュートも消えている」と誤解して成功扱いにし、台帳からも
+//    削除していたため、VCを抜けた人がミュートのまま取り残された。
+//    現在は 'not-connected' として呼び出し側に返し、台帳に「解除待ち」で残す。
+const NOT_CONNECTED_CODE = 40032;
+
+// こちらは本当に対象が存在しないケース（サーバーを抜けた等）。打つ手が無いので台帳から外す。
+// （10007 Unknown Member / 10013 Unknown User）
+const GONE_CODES = new Set([10007, 10013]);
 
 /**
  * discord.js への依存をここに閉じ込めるためのアダプタ。
@@ -45,7 +56,10 @@ export class DiscordGateway {
 
   /**
    * サーバーミュートの設定／解除。
-   * @returns {Promise<'ok'|'gone'>} 'gone' = 対象がもう居ないため解除不要だった
+   * @returns {Promise<'ok'|'not-connected'|'gone'>}
+   *   'ok'            … 反映された
+   *   'not-connected' … 相手がVCに居ないため反映できなかった（＝ミュートは残ったまま）
+   *   'gone'          … 相手がサーバーに居ない
    * @throws 本当に失敗したとき（権限不足・通信エラーなど）
    */
   async setMute(userId, mute, reason) {
@@ -55,10 +69,15 @@ export class DiscordGateway {
       await member.voice.setMute(mute, reason);
       return 'ok';
     } catch (error) {
+      if (error?.code === NOT_CONNECTED_CODE) return 'not-connected';
       if (GONE_CODES.has(error?.code)) return 'gone';
       throw error;
     }
   }
+
+  // 「今VCに繋がっているか」を事前に問い合わせる関数は意図的に持たない。
+  // 問い合わせてから setMute するまでの間に抜けられると結局ズレるため、
+  // 実際に setMute して 'not-connected' が返るかどうかで判断する（唯一の真実）。
 
   async disconnect(userId, reason) {
     const guild = await this.#guild();
@@ -67,7 +86,9 @@ export class DiscordGateway {
       await member.voice.disconnect(reason);
       return 'ok';
     } catch (error) {
-      if (GONE_CODES.has(error?.code)) return 'gone';
+      // 切断については 40032（VCに居ない）も目的達成なので成功扱いでよい。
+      // ミュート解除と違い「やり残し」が発生しない操作のため。
+      if (error?.code === NOT_CONNECTED_CODE || GONE_CODES.has(error?.code)) return 'gone';
       throw error;
     }
   }

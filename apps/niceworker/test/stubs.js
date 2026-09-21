@@ -57,15 +57,21 @@ export function createLogger(echo = false) {
 }
 
 /**
- * Discordの代わり。
- *  - voiceMembers: VCに今いる人（テストから出し入れする）
- *  - serverMuted : サーバーミュートされている人（＝Botが正しく解除できたかの答え合わせ）
+ * Discordの代わり。**本物のAPIの挙動を再現する**ことが目的。
+ *
+ *  - connections: userId → 今いるVCのID（サーバー全体。ポモドーロVCに限らない）
+ *  - serverMuted: サーバーミュートされている人（＝Botが正しく解除できたかの答え合わせ）
+ *
+ * ⚠ 最重要の再現ポイント:
+ *   VCに接続していない相手への setMute は **'not-connected' を返し、ミュート状態を変えない**。
+ *   実機の 400 / code 40032 "Target user is not connected to voice." と同じ振る舞い。
  */
 export class StubGateway {
   constructor({ vcChannelId, channelName = '作業部屋' } = {}) {
     this.vcChannelId = vcChannelId;
     this.channelName = channelName;
-    this.voiceMembers = new Set();
+    /** @type {Map<string, string>} userId → channelId */
+    this.connections = new Map();
     this.serverMuted = new Set();
     this.announcements = [];
     this.voiceStatuses = [];
@@ -80,17 +86,27 @@ export class StubGateway {
     this.voiceStatusWarnCount = 0;
   }
 
-  join(userId) { this.voiceMembers.add(userId); }
-  leave(userId) { this.voiceMembers.delete(userId); }
+  /** @param {string} channelId 既定はポモドーロVC。別のVCも指定できる */
+  join(userId, channelId = this.vcChannelId) { this.connections.set(userId, channelId); }
 
-  async listVoiceMemberIds() {
-    return [...this.voiceMembers];
+  /** VCから完全に切断する（＝以後 setMute は 40032 になる） */
+  leave(userId) { this.connections.delete(userId); }
+
+  isConnected(userId) { return this.connections.has(userId); }
+
+  async listVoiceMemberIds(channelId = this.vcChannelId) {
+    return [...this.connections.entries()]
+      .filter(([, cid]) => cid === channelId)
+      .map(([userId]) => userId);
   }
 
   async setMute(userId, mute) {
-    if (!mute && this.failUnmuteFor.has(userId)) {
+    if (this.failUnmuteFor.has(userId) && !mute) {
       throw new Error(`stub: unmute failed for ${userId}`);
     }
+    // ⚠ 実機と同じ: VCに繋がっていない相手には反映できない（ミュートは残ったまま）
+    if (!this.connections.has(userId)) return 'not-connected';
+
     if (mute) this.serverMuted.add(userId);
     else this.serverMuted.delete(userId);
     return 'ok';
@@ -98,7 +114,7 @@ export class StubGateway {
 
   async disconnect(userId) {
     this.disconnected.push(userId);
-    this.voiceMembers.delete(userId);
+    this.connections.delete(userId);
     return 'ok';
   }
 

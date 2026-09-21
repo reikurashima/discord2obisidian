@@ -33,15 +33,34 @@ export class PhaseDisplay {
       ? `全員サーバーミュートにしました。終了まで ${relative(endsAt)}（${time(endsAt)}）`
       : `ミュートを解除しました。再開まで ${relative(endsAt)}（${time(endsAt)}）`;
     const footer = typeof memberCount === 'number' ? `\n参加 ${memberCount}人` : '';
+    // Discordの仕様で「VCを抜けた人のミュートは解除できない」ため、参加者が驚かないよう
+    // 作業開始のたびに仕様を1行添える
+    const caveat = isWork
+      ? '\n-# ⚠ 作業中に抜けるとミュートが残ります。次にVCに入ると自動で解除されます。'
+      : '';
 
     // メッセージは出しっぱなしにする。Discordが <t:...:R> を勝手に数えるので編集も再送もしない
-    await this.gateway.announce(`${heading}\n${body}${footer}`);
+    await this.gateway.announce(`${heading}\n${body}${footer}${caveat}`);
     await this.#applyChannelIndicator(isWork ? '🍅 作業中' : '☕ 休憩中', isWork ? this.labels.work : this.labels.break);
   }
 
-  async showFinished(reason) {
-    await this.gateway.announce(`## ✅ ポモドーロを終了しました\n${reason}`);
+  async showFinished(reason, { pending = [] } = {}) {
+    const pendingLine = pending.length > 0
+      ? `\n⏳ ${pending.map((id) => `<@${id}>`).join(' ')} はVCを抜けているためミュートが残っています。次にVCに入ると自動で解除されます！`
+      : '';
+    await this.gateway.announce(`## ✅ ポモドーロを終了しました\n${reason}${pendingLine}`);
     await this.#clearChannelIndicator();
+  }
+
+  /**
+   * 「抜けたのでミュートが残った」人への案内。
+   * Discordの仕様上ここで解除する手段は無いので、せめて理由と解消方法を伝える。
+   */
+  async notifyPendingUnmute(userId) {
+    await this.gateway.announce(
+      `## ⏳ ミュートが残っています\n<@${userId}> さん — VCから抜けたため、Discordの仕様でこの場では解除できません。\n`
+      + '**次にどこかのVCに入った瞬間に自動で解除します！**',
+    );
   }
 
   /** 解除に失敗した人が出たとき。黙って終わらせないための告知 */

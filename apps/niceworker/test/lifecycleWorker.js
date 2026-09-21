@@ -4,7 +4,11 @@
  *
  *   node test/lifecycleWorker.js crash    <stateDir>  … 2人ミュートして異常終了（解除しない）
  *   node test/lifecycleWorker.js recover  <stateDir>  … 起動時の自動解除だけ実行
+ *   node test/lifecycleWorker.js rejoin   <stateDir>  … 起動時の自動解除 → 解除待ちの人が一般VCへ入室
  *   node test/lifecycleWorker.js sigterm  <stateDir>  … 2人ミュート後、SIGTERM待ち
+ *
+ * 環境変数 CONNECTED=alice,bob で「起動時点でVCに繋がっている人」を指定できる
+ * （繋がっていない人はDiscord仕様で解除できないため、解除待ちのまま保持されるのが正しい）。
  */
 import fs from 'fs';
 import path from 'path';
@@ -26,6 +30,9 @@ const gateway = new StubGateway({ vcChannelId: VC });
 try {
   for (const id of JSON.parse(fs.readFileSync(serverStatePath, 'utf-8'))) gateway.serverMuted.add(id);
 } catch { /* 初回は無い */ }
+
+// 起動時点でVCに繋がっている人
+for (const id of (process.env.CONNECTED ?? '').split(',').filter(Boolean)) gateway.join(id);
 
 const originalSetMute = gateway.setMute.bind(gateway);
 gateway.setMute = async (userId, mute, reason) => {
@@ -58,18 +65,29 @@ process.on('SIGTERM', () => shutdown(0));
 process.on('SIGINT', () => shutdown(0));
 
 async function main() {
-  if (mode === 'recover') {
+  if (mode === 'recover' || mode === 'rejoin') {
     await pomodoro.recoverOnStartup();
     console.log(`SERVER_MUTED_AFTER_RECOVER=${JSON.stringify([...gateway.serverMuted])}`);
     console.log(`REGISTRY_AFTER_RECOVER=${JSON.stringify(registry.list())}`);
+    console.log(`PENDING_AFTER_RECOVER=${JSON.stringify(registry.pendingList())}`);
+
+    if (mode === 'rejoin') {
+      // 解除待ちの人が、ポモドーロ専用VCではない一般VCへ入ってくる
+      for (const userId of registry.pendingList()) {
+        gateway.join(userId, 'vc-zatsudan');
+        await pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: null, newChannelId: 'vc-zatsudan' });
+      }
+      console.log(`SERVER_MUTED_AFTER_REJOIN=${JSON.stringify([...gateway.serverMuted])}`);
+      console.log(`PENDING_AFTER_REJOIN=${JSON.stringify(registry.pendingList())}`);
+    }
     process.exit(0);
   }
 
   await pomodoro.recoverOnStartup();
-  gateway.join('alice');
-  await pomodoro.handleVoiceStateUpdate({ userId: 'alice', oldChannelId: null, newChannelId: VC });
-  gateway.join('bob');
-  await pomodoro.handleVoiceStateUpdate({ userId: 'bob', oldChannelId: null, newChannelId: VC });
+  for (const userId of ['alice', 'bob']) {
+    gateway.join(userId, VC);
+    await pomodoro.handleVoiceStateUpdate({ userId, oldChannelId: null, newChannelId: VC });
+  }
   console.log(`SERVER_MUTED=${JSON.stringify([...gateway.serverMuted])}`);
   console.log('READY');
 

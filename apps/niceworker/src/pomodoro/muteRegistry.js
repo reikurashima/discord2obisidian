@@ -10,6 +10,13 @@ import path from 'path';
  *   そのため「ミュートする前に記録 → 解除できたら削除」の順で書き、
  *   起動時に残骸を全員解除してから通常動作に入る。
  *
+ * pendingUnmute（解除待ち）について:
+ *   ⚠ Discordの仕様上、VCに接続していない相手のミュートは解除できない（40032）。
+ *     つまり「VCを抜けた人をその場で解除する」ことは**不可能**。
+ *   そこで解除できなかった人は pendingUnmute=true で台帳に残し、
+ *   その人が次にどこかのVCへ入った瞬間に解除する。
+ *   この情報は再起動をまたいで保持しないと意味がないので、必ずディスクに持つ。
+ *
  * 書き込みは同期＋一時ファイル経由のrename。
  *   非同期にすると「記録前にミュートしてクラッシュ」の窓が開く。件数は数人なので同期で十分。
  */
@@ -21,7 +28,7 @@ export class MuteRegistry {
   constructor(filePath, logger) {
     this.filePath = filePath;
     this.logger = logger;
-    /** @type {Map<string, {mutedAt: number, channelId: string|null}>} */
+    /** @type {Map<string, {mutedAt: number, channelId: string|null, pendingUnmute: boolean}>} */
     this.entries = new Map();
   }
 
@@ -35,6 +42,7 @@ export class MuteRegistry {
         this.entries.set(item.userId, {
           mutedAt: typeof item.mutedAt === 'number' ? item.mutedAt : 0,
           channelId: typeof item.channelId === 'string' ? item.channelId : null,
+          pendingUnmute: item.pendingUnmute === true,
         });
       }
     } catch (error) {
@@ -58,9 +66,36 @@ export class MuteRegistry {
     return this.entries.size;
   }
 
+  /** 解除待ちの人だけ */
+  pendingList() {
+    return [...this.entries.entries()].filter(([, meta]) => meta.pendingUnmute).map(([userId]) => userId);
+  }
+
+  isPending(userId) {
+    return this.entries.get(userId)?.pendingUnmute === true;
+  }
+
+  get pendingSize() {
+    return this.pendingList().length;
+  }
+
   add(userId, channelId = null) {
-    this.entries.set(userId, { mutedAt: Date.now(), channelId });
+    // ミュートし直したのだから解除待ちは解消される
+    this.entries.set(userId, { mutedAt: Date.now(), channelId, pendingUnmute: false });
     this.persist();
+  }
+
+  /**
+   * 「VCに居ないので解除できなかった」人を解除待ちにする。
+   * ⚠ ここで台帳から消してはいけない。消すとミュートが永久に残る。
+   */
+  markPending(userId) {
+    const meta = this.entries.get(userId) ?? { mutedAt: Date.now(), channelId: null, pendingUnmute: false };
+    if (meta.pendingUnmute) return false; // 既に解除待ち（重複告知を避けるため差分を返す）
+    meta.pendingUnmute = true;
+    this.entries.set(userId, meta);
+    this.persist();
+    return true;
   }
 
   remove(userId) {

@@ -63,8 +63,12 @@ export class PomodoroManager {
   // ---------------------------------------------------------------------------
 
   /**
-   * 前回のプロセスがミュートしたまま死んだ人を、通常動作に入る前に全員解除する。
+   * 前回のプロセスがミュートしたまま死んだ人を、通常動作に入る前に解除する。
    * コンテナ再作成・クラッシュ・強制終了のいずれでもここが最後の砦。
+   *
+   * ⚠ 今VCに繋がっている人しか解除できない（Discord仕様）。
+   *   繋がっていない人は台帳に「解除待ち」で残し、次の入室で解消する。
+   *   ここで消してしまうと、その人は二度と自動解除されない。
    */
   async recoverOnStartup() {
     const leftovers = this.registry.load();
@@ -73,8 +77,19 @@ export class PomodoroManager {
       return;
     }
 
-    this.logger.warn(`[Pomodoro] 前回のミュート記録が ${leftovers.length}件 残っています。解除します: ${leftovers.join(', ')}`);
-    await this.#unmuteUsers(leftovers, '起動時の自動解除');
+    this.logger.warn(`[Pomodoro] 前回のミュート記録が ${leftovers.length}件 残っています: ${leftovers.join(', ')}`);
+    const result = await this.#unmuteUsers(leftovers, '起動時の自動解除');
+
+    this.logger.info(
+      `[Pomodoro] 起動時の解除結果: 解除 ${result.unmuted.length}人`
+      + ` / 解除待ち ${result.pending.length}人`
+      + ` / 失敗 ${result.failed.length}人`,
+    );
+    if (result.pending.length > 0) {
+      this.logger.warn(
+        `[Pomodoro] 解除待ちとして保持します（VC未接続のため今は解除できない）: ${result.pending.join(', ')}`,
+      );
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -88,15 +103,26 @@ export class PomodoroManager {
     return this.#enqueue('voiceStateUpdate', async () => {
       if (event.isBot) return;
 
-      const left = event.oldChannelId === this.vcChannelId && event.newChannelId !== this.vcChannelId;
-      const joined = event.newChannelId === this.vcChannelId && event.oldChannelId !== this.vcChannelId;
+      const movedChannel = event.oldChannelId !== event.newChannelId;
+      const leftPomodoro = event.oldChannelId === this.vcChannelId && movedChannel;
+      const joinedPomodoro = event.newChannelId === this.vcChannelId && movedChannel;
+      // ⚠ 「どこかのVCに入った」= 解除待ちを解消できる唯一のタイミング。
+      //    ポモドーロ専用VCに限定しないこと（一般VCに入っても解消されるべき）
+      const joinedAnyVoice = event.newChannelId !== null && movedChannel;
 
-      if (left) await this.#onLeave(event.userId);
-      if (joined) await this.#onJoin(event.userId);
+      if (leftPomodoro) await this.#onLeavePomodoro(event.userId);
+      if (joinedPomodoro) await this.#onJoinPomodoro(event.userId);
+
+      // 順番が大事: ポモドーロ側の処理で再ミュートされた場合は、
+      // registry.add が解除待ちを落としているのでここは何もしない
+      if (joinedAnyVoice && this.registry.isPending(event.userId)) {
+        this.logger.info(`[Pomodoro] ${event.userId} がVC(${event.newChannelId})へ入室。解除待ちを解消します`);
+        await this.#unmuteUser(event.userId, '解除待ちの自動解消（入室検知）');
+      }
     });
   }
 
-  async #onJoin(userId) {
+  async #onJoinPomodoro(userId) {
     if (this.phase === 'idle') {
       this.logger.info(`[Pomodoro] ${userId} の入室で開始します`);
       await this.#enterPhase('work');
@@ -110,17 +136,30 @@ export class PomodoroManager {
     }
   }
 
-  async #onLeave(userId) {
-    // ⚠ ここが一番大事。サーバーミュートはVCを抜けても残る可能性があるので、
-    //    抜けた本人は必ず解除する（ポモドーロが続いていても関係なく）
-    if (this.registry.has(userId)) {
-      this.logger.info(`[Pomodoro] ${userId} が退出。ミュートを解除します`);
-      await this.#unmuteUsers([userId], '退出時の自動解除');
+  async #onLeavePomodoro(userId) {
+    // ⚠ ここは「解除できたらラッキー」の位置づけになった。
+    //    VCから完全に切断した人は Discord の仕様で解除できない（40032）ため、
+    //    その場合は解除待ちとして台帳に残し、次の入室で解消する。
+    //    別のVCへ移動した場合は接続が続いているので、ここで解除できる。
+    if (this.registry.has(userId) && !this.registry.isPending(userId)) {
+      const result = await this.#unmuteUser(userId, '退出時の解除');
+      if (result === 'pending') {
+        // 本人が「なぜミュートのままなのか」分からないと困るので必ず知らせる
+        await this.#announcePending(userId);
+      }
     }
 
     const remaining = await this.#safeListMembers();
     if (remaining.length === 0 && this.phase !== 'idle') {
       await this.#stop('VCが空になりました');
+    }
+  }
+
+  async #announcePending(userId) {
+    try {
+      await this.display.notifyPendingUnmute(userId);
+    } catch (error) {
+      this.logger.error('[Pomodoro] 解除待ちの告知を出せませんでした', error);
     }
   }
 
@@ -143,8 +182,16 @@ export class PomodoroManager {
       return;
     }
 
-    if (phase === 'work') await this.#muteUsers(members);
-    else await this.#unmuteUsers(this.registry.list(), '休憩開始');
+    if (phase === 'work') {
+      await this.#muteUsers(members);
+    } else {
+      // 休憩の解除は全員VCに接続中なので成功するはず。結果を必ずログに残す
+      const result = await this.#unmuteUsers(this.registry.list(), '休憩開始');
+      this.logger.info(
+        `[Pomodoro] 休憩開始の解除結果: 解除 ${result.unmuted.length}人`
+        + ` / 解除待ち ${result.pending.length}人 / 失敗 ${result.failed.length}人`,
+      );
+    }
 
     await this.display.showPhase(phase, this.phaseEndsAt, { memberCount: members.length });
 
@@ -160,20 +207,33 @@ export class PomodoroManager {
     this.phaseEndsAt = null;
     this.cycle = 0;
 
-    await this.#unmuteUsers(this.registry.list(), reason);
-    await this.display.showFinished(reason);
-    this.logger.info(`[Pomodoro] 終了: ${reason}`);
+    const result = await this.#unmuteUsers(this.registry.list(), reason, { announcePending: true });
+    this.logger.info(
+      `[Pomodoro] 終了: ${reason} — 解除 ${result.unmuted.length}人`
+      + ` / 解除待ち ${result.pending.length}人 / 失敗 ${result.failed.length}人`,
+    );
+    await this.display.showFinished(reason, { pending: result.pending });
   }
 
-  /** SIGTERM/SIGINT から呼ぶ。告知は出さずに、とにかく全員解除する */
+  /**
+   * SIGTERM/SIGINT から呼ぶ。まだVCに接続している人は今のうちに確実に解除する。
+   * 接続していない人は解除待ちのまま台帳に残る（次回起動＋入室で解消される）。
+   */
   async shutdownUnmuteAll() {
     this.#clearTimer();
     this.phase = 'idle';
     const targets = this.registry.list();
-    if (targets.length === 0) return;
+    if (targets.length === 0) {
+      this.logger.info('[Pomodoro] 終了処理: 解除対象はありません');
+      return;
+    }
 
-    this.logger.info(`[Pomodoro] 終了処理: ${targets.length}人のミュートを解除します`);
-    await this.#unmuteUsers(targets, '停止時の自動解除');
+    this.logger.info(`[Pomodoro] 終了処理: ${targets.length}人のミュート解除を試みます`);
+    const result = await this.#unmuteUsers(targets, '停止時の自動解除');
+    this.logger.info(
+      `[Pomodoro] 終了処理の解除結果: 解除 ${result.unmuted.length}人`
+      + ` / 解除待ち ${result.pending.length}人 / 失敗 ${result.failed.length}人`,
+    );
   }
 
   #clearTimer() {
@@ -195,47 +255,91 @@ export class PomodoroManager {
     // ⚠ 記録が先。ミュート直後にクラッシュしても、次回起動で解除できるようにする
     this.registry.add(userId, this.vcChannelId);
     try {
-      await this.gateway.setMute(userId, true, 'ポモドーロ: 作業時間');
+      const result = await this.gateway.setMute(userId, true, 'ポモドーロ: 作業時間');
+      if (result === 'ok') {
+        this.logger.info(`[Pomodoro] ${userId} をミュートしました`);
+        return;
+      }
+      // ミュートできなかったのだから、解除すべきものも無い。台帳から外す
+      this.registry.remove(userId);
+      this.logger.warn(`[Pomodoro] ${userId} をミュートできませんでした（${result}）。台帳から外します`);
     } catch (error) {
       // 失敗しても記録は残す（残骸解除は空振りしても無害、解除漏れは有害）
-      this.logger.error(`[Pomodoro] ${userId} をミュートできませんでした`, error);
+      this.logger.error(`[Pomodoro] ${userId} のミュートに失敗しました（台帳には残します）`, error);
     }
   }
 
   /**
-   * 解除。リトライ込み。最後まで駄目だった人は台帳に残したまま告知する。
-   * @param {string[]} userIds
+   * まとめて解除。
+   * @returns {Promise<{unmuted: string[], pending: string[], failed: string[]}>}
    */
-  async #unmuteUsers(userIds, reason) {
-    const failed = [];
+  async #unmuteUsers(userIds, reason, { announcePending = false } = {}) {
+    const result = { unmuted: [], pending: [], failed: [] };
+    for (const userId of userIds) {
+      // 既に解除待ちだった人を二重に告知しないための差分判定
+      const wasPending = this.registry.isPending(userId);
+      const outcome = await this.#unmuteUser(userId, reason);
+
+      if (outcome === 'unmuted' || outcome === 'gone') result.unmuted.push(userId);
+      else if (outcome === 'failed') result.failed.push(userId);
+      else {
+        result.pending.push(userId);
+        if (announcePending && !wasPending) await this.#announcePending(userId);
+      }
+    }
+    return result;
+  }
+
+  /**
+   * 1人ぶんの解除。リトライ込み。
+   *
+   * ⚠ 結果を必ずログに出すこと。以前は「解除します」とだけ出して結果を出していなかったため、
+   *   実機で解除に失敗していたことに気づけなかった（2026-09-22）。
+   *
+   * @returns {Promise<'unmuted'|'pending'|'gone'|'failed'>}
+   *   'pending' … VCに居ないため解除できなかった。台帳に解除待ちとして残す
+   */
+  async #unmuteUser(userId, reason) {
     let lastError = null;
 
-    for (const userId of userIds) {
-      let done = false;
-      for (let attempt = 1; attempt <= UNMUTE_RETRIES && !done; attempt += 1) {
-        try {
-          // 'gone' = もうVCにもサーバーにも居ない → ミュート状態も一緒に消えているので成功扱い
-          await this.gateway.setMute(userId, false, reason);
-          done = true;
-        } catch (error) {
-          lastError = error;
-          this.logger.warn(`[Pomodoro] ${userId} の解除に失敗 (${attempt}/${UNMUTE_RETRIES}): ${error?.message ?? error}`);
-          if (attempt < UNMUTE_RETRIES) await this.#sleep(UNMUTE_RETRY_DELAY_MS);
-        }
-      }
-
-      if (done) this.registry.remove(userId);
-      else failed.push(userId);
-    }
-
-    if (failed.length > 0) {
-      this.logger.error(`[Pomodoro] ミュート解除に失敗したまま残っています: ${failed.join(', ')}`);
+    for (let attempt = 1; attempt <= UNMUTE_RETRIES; attempt += 1) {
       try {
-        await this.display.warnUnmuteFailure(failed, lastError?.message ?? lastError);
+        const result = await this.gateway.setMute(userId, false, reason);
+
+        if (result === 'not-connected') {
+          // ⚠ ここを成功扱いにしてはいけない。ミュートは残ったまま
+          this.registry.markPending(userId);
+          this.logger.warn(
+            `[Pomodoro] 解除できませんでした: ${userId} — VCに接続していないため（Discord仕様 40032）。`
+            + `解除待ちとして台帳に残します。次にVCへ入った時点で自動解除します（${reason}）`,
+          );
+          return 'pending';
+        }
+
+        if (result === 'gone') {
+          this.registry.remove(userId);
+          this.logger.warn(`[Pomodoro] 解除不要: ${userId} — サーバーに居ないため台帳から外しました（${reason}）`);
+          return 'gone';
+        }
+
+        this.registry.remove(userId);
+        this.logger.info(`[Pomodoro] 解除成功: ${userId}（${reason}）`);
+        return 'unmuted';
       } catch (error) {
-        this.logger.error('[Pomodoro] 解除失敗の告知も出せませんでした', error);
+        lastError = error;
+        this.logger.warn(`[Pomodoro] 解除失敗: ${userId} (${attempt}/${UNMUTE_RETRIES}) — ${error?.message ?? error}`);
+        if (attempt < UNMUTE_RETRIES) await this.#sleep(UNMUTE_RETRY_DELAY_MS);
       }
     }
+
+    // 40032 以外で最後まで駄目だったケース。台帳に残したまま告知する
+    this.logger.error(`[Pomodoro] 解除に失敗したまま残っています: ${userId}（${reason}）`);
+    try {
+      await this.display.warnUnmuteFailure([userId], lastError?.message ?? lastError);
+    } catch (error) {
+      this.logger.error('[Pomodoro] 解除失敗の告知も出せませんでした', error);
+    }
+    return 'failed';
   }
 
   #sleep(ms) {
@@ -256,11 +360,16 @@ export class PomodoroManager {
   // ---------------------------------------------------------------------------
 
   statusText() {
+    const pending = this.registry.pendingList();
+    const pendingLine = pending.length > 0
+      ? `\n⏳ 解除待ち: ${pending.map((id) => `<@${id}>`).join(' ')}（VCに入ると自動で解除されます）`
+      : '';
+
     if (this.phase === 'idle') {
-      return '## 🍅 ポモドーロ\n停止中です。専用VCに入ると自動で始まります！';
+      return `## 🍅 ポモドーロ\n停止中です。専用VCに入ると自動で始まります！${pendingLine}`;
     }
     const label = this.phase === 'work' ? '🍅 作業中' : '☕ 休憩中';
     return `## ${label}\n${this.cycle}セット目 / 切り替わりまで ${relativeTag(this.phaseEndsAt)}\n`
-      + `ミュート中: ${this.registry.size}人`;
+      + `ミュート中: ${this.registry.size - pending.length}人${pendingLine}`;
   }
 }
