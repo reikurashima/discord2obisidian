@@ -22,10 +22,6 @@ export function generateImageFilename() {
   return `dropbox_${getDateString()}_${randomString(5)}.webp`;
 }
 
-export function generateVideoFilename() {
-  return `dropbox_${getDateString()}_${randomString(5)}.mp4`;
-}
-
 export async function convertToWebp(inputBuffer) {
   try {
     const webpBuffer = await sharp(inputBuffer)

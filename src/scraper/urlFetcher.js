@@ -4,6 +4,113 @@ const TWITTER_REGEX = /https?:\/\/(www\.)?(twitter\.com|x\.com)\/(\w+)\/status\/
 const YOUTUBE_REGEX = /https?:\/\/(www\.)?(youtube\.com\/watch\?v=|youtube\.com\/shorts\/|youtu\.be\/|youtube\.com\/live\/)/;
 const URL_REGEX = /https?:\/\/\S+/;
 
+// ========== ノート／デイリー用（URL抽出と投稿者名の取得だけ） ==========
+//
+// 下の containsUrl / extractUrl / fetchUrlContent 一式は canvas チャンネルが
+// 現役で使っているので手を触れていない。
+// ノート／デイリーは「URL先の中身を取りに行かない」方針になったため、
+// そちら向けの軽い関数をここに並べる。
+
+// 本文中のURLを「全部」拾うため /g 付き。
+// /g 付き正規表現は test()/exec() で lastIndex が残って次回の判定を取りこぼすので、
+// この定数は match() 経由でしか使わないこと。
+// 日本語の読点・括弧類は文字クラスから除外している。「https://example.com、あと…」のように
+// スペースなしで続けて書かれたとき、後ろの日本語まで飲み込んでしまうため。
+// 逆に漢字・かなは除外しない（ja.wikipedia.org/wiki/日本語 のような実在のURLを壊すので）。
+const ALL_URLS_REGEX = /https?:\/\/[^\s<>"'`、。！？「」『』（）]+/g;
+
+// 末尾に句読点や閉じ括弧がくっついたURL（「... https://example.com です。」等）を切り落とすため
+const TRAILING_PUNCTUATION_REGEX = /[.,;:!?)\]}、。！？）】」]+$/;
+
+const AUTHOR_TWITTER_REGEX = /^https?:\/\/(?:www\.|mobile\.)?(?:twitter\.com|x\.com)\/([A-Za-z0-9_]+)\/status\/(\d+)/;
+const AUTHOR_YOUTUBE_REGEX = /^https?:\/\/(?:www\.|m\.)?(?:youtube\.com\/(?:watch\?|shorts\/|live\/|embed\/)|youtu\.be\/)/;
+
+// 投稿者名は「あれば嬉しい」程度の情報。待たされるくらいなら諦めるので短め。
+const AUTHOR_FETCH_TIMEOUT_MS = 5000;
+
+/**
+ * Extract every URL in the text (in order of appearance).
+ */
+export function extractUrls(text) {
+  const matches = text.match(ALL_URLS_REGEX);
+  if (!matches) return [];
+
+  return matches
+    .map((url) => url.replace(TRAILING_PUNCTUATION_REGEX, ''))
+    .filter((url) => url.length > 0);
+}
+
+/**
+ * Fetch the author display name for a URL.
+ * Returns a string, or null when the site is unsupported or the lookup fails.
+ * 失敗しても例外は投げない（投稿者名の行が1本消えるだけで、保存処理は続行させたいため）。
+ */
+export async function fetchAuthorName(url) {
+  try {
+    if (AUTHOR_TWITTER_REGEX.test(url)) {
+      return await fetchTwitterAuthorName(url);
+    }
+    if (AUTHOR_YOUTUBE_REGEX.test(url)) {
+      return await fetchYoutubeAuthorName(url);
+    }
+  } catch (error) {
+    logger.warn(`[URL] Failed to fetch author name for ${url}: ${error.message}`);
+  }
+  return null;
+}
+
+/**
+ * X / Twitter: FxTwitter API から表示名を取る（APIキー不要）。
+ */
+async function fetchTwitterAuthorName(url) {
+  const match = url.match(AUTHOR_TWITTER_REGEX);
+  if (!match) return null;
+
+  const [, screenName, tweetId] = match;
+  const apiUrl = `https://api.fxtwitter.com/${screenName}/status/${tweetId}`;
+
+  const response = await fetch(apiUrl, {
+    headers: { 'User-Agent': 'DiscordBot/1.0' },
+    signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    logger.warn(`[URL] FxTwitter returned ${response.status} for ${url}`);
+    return null;
+  }
+
+  const data = await response.json();
+  // 表示名が取れないときは screen_name で代用する（[[リンク]]先として成立するので）
+  const name = data?.tweet?.author?.name || screenName;
+  logger.info(`[URL] Author resolved: ${name} (${url})`);
+  return name;
+}
+
+/**
+ * YouTube: oEmbed から channel 名を取る（APIキー不要）。
+ */
+async function fetchYoutubeAuthorName(url) {
+  const apiUrl = `https://www.youtube.com/oembed?url=${encodeURIComponent(url)}&format=json`;
+
+  const response = await fetch(apiUrl, {
+    headers: { 'User-Agent': 'DiscordBot/1.0' },
+    signal: AbortSignal.timeout(AUTHOR_FETCH_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    // 限定公開・削除済みの動画は 401/404 を返す。取れないだけなので警告に留める
+    logger.warn(`[URL] YouTube oEmbed returned ${response.status} for ${url}`);
+    return null;
+  }
+
+  const data = await response.json();
+  const name = data?.author_name || null;
+  if (name) logger.info(`[URL] Author resolved: ${name} (${url})`);
+  return name;
+}
+
+// ========== canvas チャンネル用（URL先の中身まで取りに行く） ==========
+
 /**
  * Check if text contains a URL.
  */

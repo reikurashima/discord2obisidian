@@ -1,4 +1,9 @@
-export function sanitizeFilename(raw) {
+/**
+ * Normalize a string into a note name.
+ * 絵文字や記号だけの行は**空文字を返す**。呼び出し側で「ノート名にできなかった」と
+ * 判定して1行目を本文へ残せるように、ここではフォールバック名を付けない。
+ */
+export function sanitizeTitle(raw) {
   let name = raw.trim();
 
   // Remove characters not allowed in file paths and control characters
@@ -19,10 +24,36 @@ export function sanitizeFilename(raw) {
   // Remove leading/trailing hyphens and dots
   name = name.replace(/^[-.\s]+|[-.\s]+$/g, '');
 
-  // Fallback if empty
-  if (!name) {
-    name = `untitled-${Date.now()}`;
-  }
-
   return name;
+}
+
+/**
+ * URLをそのままノート名にする。
+ *   https://x.com/jack/status/20  →  x.com-jack-status-20
+ *
+ * sanitizeTitle に直接通すと区切り記号が「消える」だけで
+ * httpsx.comjackstatus20 になって読めないため、先にハイフンへ置き換える。
+ */
+export function urlToNoteName(url) {
+  let name = url.trim();
+
+  // スキームは全URLに付くだけで識別の役に立たないので落とす
+  name = name.replace(/^https?:\/\//i, '');
+
+  // 区切り記号をハイフンに寄せる
+  name = name.replace(/[/:?&=]+/g, '-');
+
+  // 連続ハイフンは1つに畳み、前後のハイフンは落とす（末尾スラッシュ対策）
+  name = name.replace(/-{2,}/g, '-');
+  name = name.replace(/^-+|-+$/g, '');
+
+  // 残った禁止文字・絵文字の除去と長さ制限は共通処理に任せる
+  return sanitizeTitle(name);
+}
+
+export function sanitizeFilename(raw) {
+  const name = sanitizeTitle(raw);
+
+  // Fallback if empty
+  return name || `untitled-${Date.now()}`;
 }
