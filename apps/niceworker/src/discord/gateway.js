@@ -106,6 +106,23 @@ export class DiscordGateway {
   }
 
   /**
+   * 既存の告知を書き換える。フェーズが変わるたびに新規投稿しないための仕組み。
+   * メッセージが消されている等で失敗したら false を返し、呼び出し側が新規投稿に落ちる。
+   * @returns {Promise<boolean>} 編集できたか
+   */
+  async editAnnouncement(messageId, content) {
+    try {
+      const channel = await this.#channel(this.announceChannelId);
+      const message = await channel.messages.fetch(messageId);
+      await message.edit({ content, allowedMentions: { parse: [] } });
+      return true;
+    } catch (error) {
+      logger.warn(`[Gateway] 告知メッセージを編集できませんでした: ${error?.message ?? error}`);
+      return false;
+    }
+  }
+
+  /**
    * VC名の下に出る「ステータス」。discord.js に専用メソッドが無いので REST を直接叩く。
    * @returns {Promise<boolean>} 成功したか
    */

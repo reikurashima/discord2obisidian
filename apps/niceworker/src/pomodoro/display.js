@@ -3,12 +3,18 @@ import { relativeTag as relative, timeTag as time } from '../utils/time.js';
 /**
  * 「今どのフェーズか」をDiscord上に見せる係。3段構えで、上から順に試す。
  *
- *   (a) 告知チャンネルへ <t:...:R> 付きのメッセージ  … 必ず出す。カウントダウンはDiscord任せ
- *   (b) VCチャンネルのステータス                     … 権限/API次第。駄目なら一度警告して以後スキップ
- *   (c) VCチャンネル名の変更                         … (b)が使えないときだけ。レート制限に当たったら黙って諦める
+ *   (a) 告知チャンネルのメッセージ1本  … <t:...:R> 付き。カウントダウンはDiscord任せ
+ *   (b) VCチャンネルのステータス       … 権限/API次第。駄目なら一度警告して以後スキップ
+ *   (c) VCチャンネル名の変更           … (b)が使えないときだけ。レート制限に当たったら黙って諦める
  *
  * (b)(c) はどちらも「失敗しても機能全体を止めない」。ポモドーロ本体（ミュート制御）は
  * 表示に一切依存させない。
+ *
+ * ⚠ 告知は「1ポモドーロにつき1メッセージ」。
+ *   フェーズが変わるたびに新規投稿すると、25分ごとにチャットが告知で埋まる。
+ *   そこで最初の1本だけ投稿し、以後はそれを編集して書き換える。
+ *   <t:...:R> は編集しても自動カウントダウンが効くので、これで困らない。
+ *   編集に失敗したら（メッセージが消された等）新規投稿に落として機能は止めない。
  */
 export class PhaseDisplay {
   constructor({ gateway, vcChannelId, labels, logger }) {
@@ -19,6 +25,8 @@ export class PhaseDisplay {
     /** VC名を戻すために、最初に見た名前を覚えておく */
     this.originalName = null;
     this.renameActive = false;
+    /** 今のポモドーロで使い回している告知メッセージのID。終了したら手放す */
+    this.liveMessageId = null;
   }
 
   /**
@@ -39,31 +47,34 @@ export class PhaseDisplay {
       ? '\n-# ⚠ 作業中に抜けるとミュートが残ります。次にVCに入ると自動で解除されます。'
       : '';
 
-    // メッセージは出しっぱなしにする。Discordが <t:...:R> を勝手に数えるので編集も再送もしない
-    await this.gateway.announce(`${heading}\n${body}${footer}${caveat}`);
+    await this.#publish(`${heading}\n${body}${footer}${caveat}`);
     await this.#applyChannelIndicator(isWork ? '🍅 作業中' : '☕ 休憩中', isWork ? this.labels.work : this.labels.break);
   }
 
-  async showFinished(reason, { pending = [] } = {}) {
-    const pendingLine = pending.length > 0
-      ? `\n⏳ ${pending.map((id) => `<@${id}>`).join(' ')} はVCを抜けているためミュートが残っています。次にVCに入ると自動で解除されます！`
-      : '';
-    await this.gateway.announce(`## ✅ ポモドーロを終了しました\n${reason}${pendingLine}`);
+  async showFinished(reason) {
+    // 最後の1回も編集で済ませる。終わったらメッセージを手放し、次のポモドーロは新しい1本を立てる
+    await this.#publish(`## ✅ ポモドーロを終了しました\n${reason}\nおつかれさまでした！`);
+    this.liveMessageId = null;
     await this.#clearChannelIndicator();
   }
 
   /**
-   * 「抜けたのでミュートが残った」人への案内。
-   * Discordの仕様上ここで解除する手段は無いので、せめて理由と解消方法を伝える。
+   * 告知を1本に保つ。既存があれば編集、無ければ（または編集に失敗したら）新規投稿。
+   * 編集の失敗理由は「メッセージが消された」「権限が変わった」など様々だが、
+   * どれも機能を止める理由にはならないので必ず投稿側へ落ちる。
    */
-  async notifyPendingUnmute(userId) {
-    await this.gateway.announce(
-      `## ⏳ ミュートが残っています\n<@${userId}> さん — VCから抜けたため、Discordの仕様でこの場では解除できません。\n`
-      + '**次にどこかのVCに入った瞬間に自動で解除します！**',
-    );
+  async #publish(content) {
+    if (this.liveMessageId) {
+      const edited = await this.gateway.editAnnouncement(this.liveMessageId, content);
+      if (edited) return;
+      this.logger.warn('[Display] 告知メッセージを編集できませんでした。新規投稿に切り替えます');
+      this.liveMessageId = null;
+    }
+    // announce は失敗すると null を返す。その場合は次回また新規投稿を試みる
+    this.liveMessageId = await this.gateway.announce(content);
   }
 
-  /** 解除に失敗した人が出たとき。黙って終わらせないための告知 */
+  /** 解除に失敗した人が出たとき。埋もれては困るので、これだけは常に新規投稿にする */
   async warnUnmuteFailure(userIds, detail) {
     const mentions = userIds.map((id) => `<@${id}>`).join(' ');
     await this.gateway.announce(

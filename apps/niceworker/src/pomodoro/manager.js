@@ -141,25 +141,17 @@ export class PomodoroManager {
     //    VCから完全に切断した人は Discord の仕様で解除できない（40032）ため、
     //    その場合は解除待ちとして台帳に残し、次の入室で解消する。
     //    別のVCへ移動した場合は接続が続いているので、ここで解除できる。
+    //
+    // 解除待ちになったことは**告知しない**（通知が冗長になるため）。
+    // 作業開始の告知に「抜けるとミュートが残る」と毎回書いてあるので周知はそれで足りる。
+    // 運用者が追えるようにログには必ず残し、`/pomo status` でも確認できる。
     if (this.registry.has(userId) && !this.registry.isPending(userId)) {
-      const result = await this.#unmuteUser(userId, '退出時の解除');
-      if (result === 'pending') {
-        // 本人が「なぜミュートのままなのか」分からないと困るので必ず知らせる
-        await this.#announcePending(userId);
-      }
+      await this.#unmuteUser(userId, '退出時の解除');
     }
 
     const remaining = await this.#safeListMembers();
     if (remaining.length === 0 && this.phase !== 'idle') {
       await this.#stop('VCが空になりました');
-    }
-  }
-
-  async #announcePending(userId) {
-    try {
-      await this.display.notifyPendingUnmute(userId);
-    } catch (error) {
-      this.logger.error('[Pomodoro] 解除待ちの告知を出せませんでした', error);
     }
   }
 
@@ -207,12 +199,13 @@ export class PomodoroManager {
     this.phaseEndsAt = null;
     this.cycle = 0;
 
-    const result = await this.#unmuteUsers(this.registry.list(), reason, { announcePending: true });
+    const result = await this.#unmuteUsers(this.registry.list(), reason);
+    // 解除待ちの人は告知に出さない（ログと /pomo status で足りる）
     this.logger.info(
       `[Pomodoro] 終了: ${reason} — 解除 ${result.unmuted.length}人`
       + ` / 解除待ち ${result.pending.length}人 / 失敗 ${result.failed.length}人`,
     );
-    await this.display.showFinished(reason, { pending: result.pending });
+    await this.display.showFinished(reason);
   }
 
   /**
@@ -273,19 +266,14 @@ export class PomodoroManager {
    * まとめて解除。
    * @returns {Promise<{unmuted: string[], pending: string[], failed: string[]}>}
    */
-  async #unmuteUsers(userIds, reason, { announcePending = false } = {}) {
+  async #unmuteUsers(userIds, reason) {
     const result = { unmuted: [], pending: [], failed: [] };
     for (const userId of userIds) {
-      // 既に解除待ちだった人を二重に告知しないための差分判定
-      const wasPending = this.registry.isPending(userId);
       const outcome = await this.#unmuteUser(userId, reason);
 
       if (outcome === 'unmuted' || outcome === 'gone') result.unmuted.push(userId);
       else if (outcome === 'failed') result.failed.push(userId);
-      else {
-        result.pending.push(userId);
-        if (announcePending && !wasPending) await this.#announcePending(userId);
-      }
+      else result.pending.push(userId);
     }
     return result;
   }

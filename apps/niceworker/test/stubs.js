@@ -73,7 +73,13 @@ export class StubGateway {
     /** @type {Map<string, string>} userId → channelId */
     this.connections = new Map();
     this.serverMuted = new Set();
+    /** 新規投稿された本文（＝チャットに増えたメッセージの数） */
     this.announcements = [];
+    /** 編集された本文（チャットは増えない） */
+    this.edits = [];
+    /** @type {Map<string, string>} messageId → 現在の本文 */
+    this.messages = new Map();
+    this.messageSeq = 0;
     this.voiceStatuses = [];
     this.renames = [];
     this.disconnected = [];
@@ -81,9 +87,15 @@ export class StubGateway {
     // 失敗注入用
     this.failVoiceStatus = false;
     this.failRename = false;
+    this.failEdit = false;
     this.failUnmuteFor = new Set();
     this.voiceStatusDisabled = false;
     this.voiceStatusWarnCount = 0;
+  }
+
+  /** 今チャットに見えている本文（編集後の最新） */
+  liveTexts() {
+    return [...this.messages.values()];
   }
 
   /** @param {string} channelId 既定はポモドーロVC。別のVCも指定できる */
@@ -119,8 +131,18 @@ export class StubGateway {
   }
 
   async announce(content) {
+    const id = `msg-${++this.messageSeq}`;
     this.announcements.push(content);
-    return `msg-${this.announcements.length}`;
+    this.messages.set(id, content);
+    return id;
+  }
+
+  async editAnnouncement(messageId, content) {
+    // メッセージが消された／権限が無い等を再現する
+    if (this.failEdit || !this.messages.has(messageId)) return false;
+    this.messages.set(messageId, content);
+    this.edits.push(content);
+    return true;
   }
 
   async setVoiceStatus(channelId, status) {

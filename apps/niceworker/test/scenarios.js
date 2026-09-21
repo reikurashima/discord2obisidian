@@ -92,13 +92,52 @@ async function scenarioBasicCycle() {
   check('休憩の解除結果の内訳が出る',
     logger.lines.some((l) => l.includes('休憩開始の解除結果') && l.includes('解除 1人')));
   console.log(`    ${logger.lines.filter((l) => l.includes('休憩開始')).join('\n    ')}`);
-  console.log(`    告知: ${h.gateway.announcements[1].replace(/\n/g, ' / ')}`);
+
+  // ⚠ 今回の変更点: フェーズが変わっても新規投稿は増えず、同じ1本が編集される
+  check('新規投稿は増えていない（1本のまま）', h.gateway.announcements.length === 1,
+    `新規投稿=${h.gateway.announcements.length}件 / 編集=${h.gateway.edits.length}回`);
+  check('編集で休憩の内容に差し替わる', h.gateway.liveTexts()[0].includes('☕ 休憩タイムです'));
+  console.log(`    編集後の本文: ${h.gateway.liveTexts()[0].replace(/\n/g, ' / ')}`);
 
   await clock.advance(BREAK_MS);
   check('5分後に作業へ戻る', h.pomodoro.phase === 'work', `phase=${h.pomodoro.phase}`);
   check('再びミュートされる', h.gateway.serverMuted.has('alice'));
   check('2セット目になっている', h.pomodoro.cycle === 2, `cycle=${h.pomodoro.cycle}`);
+
+  // 何サイクル回しても投稿が増えないこと（長時間やっても埋まらない）
+  await clock.advance((WORK_MS + BREAK_MS) * 3);
+  check('計5サイクル回しても新規投稿は1本のまま', h.gateway.announcements.length === 1,
+    `新規投稿=${h.gateway.announcements.length}件 / 編集=${h.gateway.edits.length}回`);
+  check('5セット目になっている', h.pomodoro.cycle === 5, `cycle=${h.pomodoro.cycle}`);
+  console.log(`    チャットに見えるメッセージ: ${h.gateway.messages.size}本 / 編集 ${h.gateway.edits.length}回`);
   console.log(`    VCステータス履歴: ${JSON.stringify(h.gateway.voiceStatuses)}`);
+}
+
+async function scenarioEditFallback() {
+  section('1-b. 告知の編集に失敗したら新規投稿へフォールバックする');
+  const clock = new FakeClock(Date.parse('2026-09-22T20:00:00+09:00'));
+  const logger = createLogger();
+  const h = buildHarness({ clock, statePath: path.join(stateDir, 'edit.json'), logger });
+
+  await join(h, 'alice');
+  check('最初は新規投稿', h.gateway.announcements.length === 1);
+
+  h.gateway.failEdit = true; // メッセージが消された・権限が変わった等を再現
+  await clock.advance(WORK_MS);
+
+  check('編集に失敗したら新規投稿に落ちる', h.gateway.announcements.length === 2,
+    `新規投稿=${h.gateway.announcements.length}件`);
+  check('フェーズ遷移は止まらない', h.pomodoro.phase === 'break', `phase=${h.pomodoro.phase}`);
+  check('ミュート制御は通常どおり', h.gateway.serverMuted.size === 0);
+  check('警告ログが出る', logger.lines.some((l) => l.includes('新規投稿に切り替えます')));
+  console.log(`    ${logger.lines.find((l) => l.includes('新規投稿に切り替えます'))}`);
+
+  // 復旧したら、また1本を編集し続ける
+  h.gateway.failEdit = false;
+  await clock.advance(BREAK_MS);
+  check('復旧後はまた編集に戻る',
+    h.gateway.announcements.length === 2 && h.gateway.edits.length >= 1,
+    `新規投稿=${h.gateway.announcements.length}件 / 編集=${h.gateway.edits.length}回`);
 }
 
 async function scenarioLateJoiner() {
@@ -134,9 +173,16 @@ async function scenarioLeaverPending() {
   check('ポモドーロは続行', h.pomodoro.phase === 'work');
   check('40032のログが結果を明示している',
     logger.lines.some((l) => l.includes('解除できませんでした: bob') && l.includes('40032')));
-  check('本人への案内が告知される', h.gateway.announcements.some((m) => m.includes('ミュートが残っています')));
+  // 通知が冗長になるため、解除待ちの告知は出さない（ログと /pomo status に残す方針）
+  check('「ミュートが残っています」の告知は出さない',
+    !h.gateway.announcements.some((m) => m.includes('ミュートが残っています'))
+    && !h.gateway.liveTexts().some((m) => m.includes('ミュートが残っています')));
+  check('退出しても告知は増えない（1本のまま）', h.gateway.announcements.length === 1,
+    `新規投稿=${h.gateway.announcements.length}件`);
+  check('ログには残っている', logger.lines.some((l) => l.includes('解除待ちとして台帳に残します')));
+  check('/pomo status で解除待ちが分かる', h.pomodoro.statusText().includes('解除待ち'));
   console.log(`    ログ: ${logger.lines.find((l) => l.includes('解除できませんでした: bob'))}`);
-  console.log(`    告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
+  console.log(`    status: ${h.pomodoro.statusText().replace(/\n/g, ' / ')}`);
 
   // ディスクにも解除待ちが載っていること（再起動しても失われない）
   const onDisk = JSON.parse(fs.readFileSync(path.join(stateDir, 'leave.json'), 'utf-8'));
@@ -185,9 +231,12 @@ async function scenarioEmptyVc() {
   check('idleに戻る', h.pomodoro.phase === 'idle', `phase=${h.pomodoro.phase}`);
   check('2人とも解除待ちで保持される', h.registry.pendingSize === 2, `pending=${h.registry.pendingList()}`);
   check('ミュートはまだ残っている（解除不能なので当然）', h.gateway.serverMuted.size === 2);
-  check('終了の告知が出る', h.gateway.announcements.some((m) => m.includes('終了しました')));
-  check('終了告知に解除待ちが明記される', h.gateway.announcements.at(-1).includes('次にVCに入ると自動で解除'));
-  console.log(`    最後の告知: ${h.gateway.announcements.at(-1).replace(/\n/g, ' / ')}`);
+  check('終了の表示になる', h.gateway.liveTexts().some((m) => m.includes('終了しました')));
+  check('終了も編集で済ませる（投稿は1本のまま）', h.gateway.announcements.length === 1,
+    `新規投稿=${h.gateway.announcements.length}件 / 編集=${h.gateway.edits.length}回`);
+  check('終了告知に解除待ちを列挙しない（冗長なので削除）',
+    !h.gateway.liveTexts().some((m) => m.includes('<@alice>')));
+  console.log(`    最終的な本文: ${h.gateway.liveTexts()[0].replace(/\n/g, ' / ')}`);
 
   // 次のフェーズタイマーが残っていないこと（空のVCで勝手に再開しない）
   await clock.advance(WORK_MS * 2);
@@ -199,6 +248,15 @@ async function scenarioEmptyVc() {
   await join(h, 'bob', 'vc-zatsudan');
   check('bobも解除される', !h.gateway.serverMuted.has('bob') && !h.registry.has('bob'));
   check('解除待ちが0件', h.registry.pendingSize === 0);
+  check('一般VCへの入室では告知しない', h.gateway.announcements.length === 1,
+    `新規投稿=${h.gateway.announcements.length}件`);
+
+  // 次のポモドーロは新しい1本を立てる（前回の「終了しました」を書き換えない）
+  await join(h, 'alice');
+  check('新しいポモドーロは新規投稿になる', h.gateway.announcements.length === 2,
+    `新規投稿=${h.gateway.announcements.length}件`);
+  check('前回の終了メッセージは残る',
+    h.gateway.liveTexts()[0].includes('終了しました') && h.gateway.liveTexts()[1].includes('作業開始'));
 }
 
 async function scenarioCrashRecovery() {
@@ -412,6 +470,7 @@ async function main() {
 
   try {
     await scenarioBasicCycle();
+    await scenarioEditFallback();
     await scenarioLateJoiner();
     await scenarioLeaverPending();
     await scenarioMoveToAnotherVc();
