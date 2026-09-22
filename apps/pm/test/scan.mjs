@@ -34,10 +34,26 @@ process.env.SCAN_MAX_MESSAGES_PER_CHANNEL = '200';
 process.env.RUNNER_QUEUE_DIR = queueDir;
 process.env.SCAN_JOB_TIMEOUT_MS = '20000';
 process.env.SCAN_JOB_POLL_INTERVAL_MS = '30';
+process.env.SCAN_REPORT_CHANNEL_ID = 'chan-report';
+process.env.SCAN_RUN_ON_BOOT = '0';
 process.env.PORTAL_PM_URL = 'https://portal.example/pm';
 
 await fs.rm(workDir, { recursive: true, force: true });
 await fs.mkdir(stateDir, { recursive: true });
+
+// ⚠ 起動直後のティックで「今日ぶんの走査」が勝手に走り出さないようにしておく。
+//    実行した実時刻が SCAN_AT(09:00) を過ぎているかどうかでテスト結果が変わってしまうため。
+//    このテストは走査を forceScan で明示的に呼ぶ。
+await fs.mkdir(path.join(stateDir, '.state'), { recursive: true });
+await fs.writeFile(
+  path.join(stateDir, '.state', 'scan-state.json'),
+  `${JSON.stringify({ lastScanDate: todayJst(), lastStatus: 'ok', lastError: null }, null, 2)}\n`,
+  'utf-8',
+);
+
+function todayJst() {
+  return new Date(Date.now() + 9 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
 
 // ---- 検証結果の集計 -------------------------------------------------
 
@@ -107,6 +123,7 @@ stub.__addChannel({ id: 'chan-2', name: '案件B', parentId: 'cat-active' });
 stub.__addChannel({ id: 'chan-archived', name: '案件Z-終了', parentId: 'cat-archive' });
 stub.__addChannel({ id: 'chan-excluded', name: '雑談', parentId: 'cat-active' });
 stub.__addChannel({ id: 'chan-notify', name: 'pm-通知', parentId: 'cat-active' });
+stub.__addChannel({ id: 'chan-report', name: 'pm', parentId: 'cat-active' });
 stub.__addChannel({ id: 'chan-empty', name: '本文が空', parentId: 'cat-active' });
 stub.__addChannel({ id: 'voice-1', name: '作業通話', type: stub.ChannelType.GuildVoice, parentId: 'cat-active' });
 
@@ -124,6 +141,7 @@ const mB = msg('chan-2', { text: TXT_B, author: 'Rei', authorId: OWNER, atMs: NO
 msg('chan-archived', { text: 'アーカイブの発言。読まれてはいけない', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
 msg('chan-excluded', { text: '除外設定のチャンネル。読まれてはいけない', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
 msg('chan-notify', { text: '通知先チャンネル。読まれてはいけない', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
+msg('chan-report', { text: '走査レポートの投稿先。読まれてはいけない', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
 msg('chan-empty', { text: '', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
 msg('voice-1', { text: 'ボイスチャンネル。対象外', author: 'Rei', authorId: OWNER, atMs: NOW - HOUR });
 
@@ -211,6 +229,12 @@ check(
   !quotedTexts.some((t) => t.includes('通知先チャンネル')),
 );
 check(
+  '走査レポートの投稿先チャンネルが走査対象から除外される（自分の通知を読み返さない）',
+  !quotedTexts.some((t) => t.includes('走査レポートの投稿先'))
+    && !job.input.channels.some((c) => c.id === 'chan-report'),
+  `対象チャンネル: ${job.input.channels.map((c) => c.name).join(', ')}`,
+);
+check(
   'Bot自身の投稿と他のBotの投稿が除外される',
   !quotedTexts.some((t) => t.includes('別件') || t.includes('他のBotの自動投稿')),
 );
@@ -282,15 +306,31 @@ check(
   JSON.stringify(cand1.evidence),
 );
 
-// --- DM ---
+// --- 走査レポート（pm チャンネルへ。DMは廃止） ---
+const report1 = takeReports();
 check(
-  '候補が1件以上あればオーナーにDMが1通だけ飛ぶ（中身は書かない・ポータルのリンクつき）',
-  stub.__dms.length === 1
-    && stub.__dms[0].userId === OWNER
-    && stub.__dms[0].content.includes('2 件')
-    && stub.__dms[0].content.includes('https://portal.example/pm')
-    && !stub.__dms[0].content.includes('修正版データ'),
-  JSON.stringify(stub.__dms, null, 2),
+  '走査レポートが pm チャンネルに1通だけ投稿される（オーナーへのDMは送らない）',
+  report1.length === 1 && report1[0].channelId === 'chan-report' && stub.__dms.length === 0,
+  `reports=${report1.length} dms=${stub.__dms.length}`,
+);
+check(
+  'レポートの文面が指定どおり（🔍見出し・実行/対象/候補/使用・ポータルのリンク・候補の中身は書かない）',
+  report1[0].content.startsWith('## 🔍 会話の走査を実行しました\n```\n')
+    && /\n実行     \d{4}-\d{2}-\d{2} \d{2}:\d{2}\n/.test(report1[0].content)
+    && /\n対象     3チャンネル \/ 発言 2件\n/.test(report1[0].content)
+    && /\n候補     2件（未判断）\n/.test(report1[0].content)
+    && /\n使用     Claude Haiku 4\.5 \/ ジョブ 1本\n/.test(report1[0].content)
+    && report1[0].content.includes('; 判断はこちらから\nhttps://portal.example/pm/scans')
+    && report1[0].content.endsWith('```')
+    && !report1[0].content.includes('修正版データ'),
+  report1[0].content,
+);
+check(
+  'レポートはメンションしない（毎日飛ぶので鳴らさない）',
+  JSON.stringify(report1[0].allowedMentions) === JSON.stringify({ parse: [], users: [] })
+    && !/<@[!&]?\d/.test(report1[0].content)
+    && !report1[0].content.includes('@everyone') && !report1[0].content.includes('@here'),
+  JSON.stringify(report1[0].allowedMentions),
 );
 
 // --- カーソル ---
@@ -447,10 +487,14 @@ check(
     && job2.quoted[0].text === '今日の追加発言です。特にタスクはありません。',
   `引用 ${job2.quoted.length} 件: ${job2.quoted.map((q) => q.text).join(' | ')}`,
 );
+const report2 = takeReports();
 check(
-  '候補が0件ならDMを送らない',
-  scan2.scan.ok === true && scan2.scan.candidates.length === 0 && stub.__dms.length === 0,
-  `dms=${stub.__dms.length}`,
+  '候補が0件でも必ずレポートが飛ぶ（「候補 0件」と明記する）',
+  scan2.scan.ok === true && scan2.scan.candidates.length === 0
+    && report2.length === 1
+    && /\n候補     0件（未判断）\n/.test(report2[0].content)
+    && stub.__dms.length === 0,
+  report2[0]?.content || '(レポートが飛んでいません)',
 );
 current = JSON.parse(await fs.readFile(scanPath, 'utf-8'));
 check(
@@ -503,7 +547,7 @@ check(
 );
 check(
   '一度 ignore された候補は再提案しない',
-  scan3.scan.candidates.length === 0 && stub.__dms.length === 0,
+  scan3.scan.candidates.length === 0 && takeReports().length === 1 && stub.__dms.length === 0,
   `新しい候補=${scan3.scan.candidates.length} / droppedIgnored=${scan3.scan.stats.droppedIgnored} / droppedDuplicate=${scan3.scan.stats.droppedDuplicate}`,
 );
 
@@ -533,10 +577,17 @@ check(
   runner.jobs.length === 1,
   `jobs=${runner.jobs.length}`,
 );
+const reportFailed = takeReports();
 check(
-  '走査が失敗したらオーナーにDMで知らせる',
-  failed.scan.ok === false && stub.__dms.length === 1 && stub.__dms[0].content.includes('失敗'),
-  JSON.stringify(stub.__dms, null, 2),
+  '走査が失敗したら ❌ の見出しで pm チャンネルに理由を出す（DMは送らない）',
+  failed.scan.ok === false
+    && reportFailed.length === 1
+    && reportFailed[0].channelId === 'chan-report'
+    && reportFailed[0].content.startsWith('## ❌ 会話の走査に失敗しました\n```\n')
+    && reportFailed[0].content.includes('理由     AUTH: claude のログインが切れています')
+    && JSON.stringify(reportFailed[0].allowedMentions) === JSON.stringify({ parse: [], users: [] })
+    && stub.__dms.length === 0,
+  reportFailed[0]?.content || '(レポートが飛んでいません)',
 );
 const runState = JSON.parse(await fs.readFile(path.join(stateDir, '.state', 'scan-state.json'), 'utf-8'));
 check(
@@ -548,8 +599,22 @@ check(
 // --- 取得した人の発言が全部 空だった場合（= Intent無効の典型） ---
 console.log('\n===== 6. 本文がすべて空だったとき =====\n');
 
-msg('chan-2', { text: '', author: 'Rei', authorId: OWNER, atMs: NOW + 25 * HOUR });
-msg('chan-2', { text: '', author: 'Rei', authorId: OWNER, atMs: NOW + 25 * HOUR + 1000 });
+// ⚠ 直前の走査は失敗しているので、そのぶんの発言はカーソルが進んでいない＝もう一度渡される。
+//    まず成功する走査を1回挟んで、取り残しを解消してから「本文が空だけ」の状況を作る。
+nextResponse = (j) => okResult(j.jobId, []);
+runner.jobs.length = 0;
+__resetScanning();
+await runScanTick(discordClient, NOW + 26 * HOUR, { forceScan: true });
+takeReports();
+check(
+  '失敗した走査ぶんの発言は、カーソルを進めていないので次回にもう一度渡される',
+  runner.jobs.length === 1
+    && runner.jobs[0].quoted.some((q) => q.text === '翌日の発言。これが走査のきっかけになる。'),
+  `引用: ${runner.jobs[0]?.quoted.map((q) => q.text).join(' | ')}`,
+);
+
+msg('chan-2', { text: '', author: 'Rei', authorId: OWNER, atMs: NOW + 27 * HOUR });
+msg('chan-2', { text: '', author: 'Rei', authorId: OWNER, atMs: NOW + 27 * HOUR + 1000 });
 capturedWarnings.length = 0;
 runner.jobs.length = 0;
 __resetScanning();
@@ -561,10 +626,18 @@ check(
     && emptyScan.scan.stats.contentLooksDisabled === true,
   capturedWarnings.join('\n') || '(警告が出ていません)',
 );
+const reportEmpty = takeReports();
 check(
   '本文が空だけのときは runner にジョブを投げない（無駄なトークンを使わない）',
   runner.jobs.length === 0 && stub.__dms.length === 0,
   `jobs=${runner.jobs.length}`,
+);
+check(
+  'ジョブを投げなかった日も「ジョブ 0本・候補 0件」でレポートは飛ぶ',
+  reportEmpty.length === 1
+    && /\n使用     Claude Haiku 4\.5 \/ ジョブ 0本\n/.test(reportEmpty[0].content)
+    && /\n候補     0件（未判断）\n/.test(reportEmpty[0].content),
+  reportEmpty[0]?.content || '(レポートが飛んでいません)',
 );
 
 // =====================================================================
@@ -626,6 +699,15 @@ if (!args.keep) await fs.rm(workDir, { recursive: true, force: true });
 process.exit(failedChecks.length === 0 ? 0 : 1);
 
 // ---- utils ----------------------------------------------------------
+
+/** pm チャンネルに出た走査レポートを取り出す（取り出したぶんは消す） */
+function takeReports() {
+  const picked = stub.__sentMessages.filter((m) => m.channelId === 'chan-report');
+  const rest = stub.__sentMessages.filter((m) => m.channelId !== 'chan-report');
+  stub.__sentMessages.length = 0;
+  stub.__sentMessages.push(...rest);
+  return picked;
+}
 
 /** ポータルが scans/*.json を書き換えた状況を作る（Botのキューを通さず直接書く） */
 async function patchScan(date, mutate) {

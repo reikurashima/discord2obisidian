@@ -15,6 +15,10 @@ for (const key of required) {
   }
 }
 
+// NiceCraft Production の #pm チャンネル。走査レポートの既定の送り先。
+// ⚠ .env に SCAN_REPORT_CHANNEL_ID が無いまま動かしても通知が止まらないよう、既定値を持たせている。
+const DEFAULT_REPORT_CHANNEL_ID = '1551615960320974951';
+
 export const config = {
   discord: {
     token: process.env.DISCORD_TOKEN,
@@ -57,11 +61,21 @@ export const config = {
     //    ここは "専用の通知チャンネルを作った場合の受け皿" として残してある。
     notifyChannelIds: csv(process.env.SCAN_NOTIFY_CHANNEL_IDS),
 
-    // カーソルが無いチャンネルを初めて読むとき、何時間ぶんまで遡るか
-    firstRunHours: positiveInt(process.env.SCAN_FIRST_RUN_HOURS, 24),
+    // カーソルが無いチャンネルを初めて読むとき、何時間ぶんまで遡るか。
+    // ★ 0 **または未設定** で「期間の制限なし＝チャンネルの最初から」読む（初回バックフィル）。
+    //   本人指示「基本は直近24時間でいいけど、初回は全部やるようにして」。
+    //   ⚠ 効くのは **カーソルが無いチャンネル（＝一度も読んでいないチャンネル）だけ**。
+    //     2回目以降はカーソル以降しか読まないので、ここを変えても過去は掘り返さない。
+    firstRunHours: nonNegativeInt(process.env.SCAN_FIRST_RUN_HOURS, 0),
 
-    // 1回の走査で1チャンネルから取る上限。超えたら新しい方を優先してカーソルは進める
+    // 1回の走査で1チャンネルから取る上限。超えたら新しい方を優先してカーソルは進める。
+    // ⚠ カーソルが無いチャンネル（＝初回）だけはこの上限を外す。
+    //    代わりに maxMessagesPerJob でジョブを分割し、1本が膨らまないようにする。
     maxMessagesPerChannel: positiveInt(process.env.SCAN_MAX_MESSAGES_PER_CHANNEL, 200),
+
+    // 1ジョブに詰める発言数の上限。超えたぶんはジョブを分けて順番に投げる。
+    // ⚠ runner は直列実行なので、1本ずつ結果を待ってから次を投げること。
+    maxMessagesPerJob: positiveInt(process.env.SCAN_MAX_MESSAGES_PER_JOB, 300),
 
     // claude-runner のキュー（compose でマウントする）
     runnerQueueDir: (process.env.RUNNER_QUEUE_DIR || '/runner-queue').replace(/[/\\]+$/, '') || '/runner-queue',
@@ -71,7 +85,16 @@ export const config = {
     jobTimeoutMs: positiveInt(process.env.SCAN_JOB_TIMEOUT_MS, 10 * 60 * 1000),
     jobPollIntervalMs: positiveInt(process.env.SCAN_JOB_POLL_INTERVAL_MS, 2000),
 
-    // DMに載せるポータルのURL（任意）
+    // 走査レポートの投稿先チャンネル（NiceCraft Production の #pm）。
+    // ★ 候補が0件でも毎日ここに投稿する。オーナーへのDMは廃止した。
+    // ⚠ このチャンネルは走査対象から自動で外す（自分の通知を読み返さないため。collect.js 参照）。
+    reportChannelId: (process.env.SCAN_REPORT_CHANNEL_ID || DEFAULT_REPORT_CHANNEL_ID).trim(),
+
+    // 1 で起動直後に1回走査する（初回バックフィルを手で走らせるための口）。
+    // 既定は 0。使い終わったら .env から外す。
+    runOnBoot: process.env.SCAN_RUN_ON_BOOT === '1',
+
+    // レポートに載せるポータルのURL（任意）
     portalUrl: process.env.PORTAL_PM_URL || '',
   },
 };
@@ -86,6 +109,12 @@ function csv(value) {
 function positiveInt(value, fallback) {
   const n = Number.parseInt(value, 10);
   return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
+/** 0 を「意味のある値（＝制限なし）」として受け取りたい設定用。未設定・壊れた値は fallback */
+function nonNegativeInt(value, fallback) {
+  const n = Number.parseInt(value, 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
 /** "HH:mm" を読む。壊れていても起動は止めない（走査の時刻は起動を諦めるほどの設定ではない） */

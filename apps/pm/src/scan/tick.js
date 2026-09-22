@@ -1,7 +1,7 @@
 import { config } from '../config.js';
 import { logger } from '../utils/logger.js';
-import { atJstTimeOfDay, jstDateString } from '../utils/datetime.js';
-import { dmOwner } from '../discord/notify.js';
+import { atJstTimeOfDay, jstDateString, jstParts } from '../utils/datetime.js';
+import { postQuietly } from '../discord/notify.js';
 import { markScanRun, readRunState } from './store.js';
 import { runScan } from './scan.js';
 import { applyDecisions } from './decisions.js';
@@ -16,6 +16,10 @@ import { applyDecisions } from './decisions.js';
 //    走っている間に次のティックが来ても二重に走らせない。
 
 let scanning = false;
+
+// SCAN_RUN_ON_BOOT=1 のときだけ、起動後の最初のティックで時刻を待たずに1回走らせる。
+// 初回バックフィルを手で走らせるための口（使い終わったら .env から外す）。
+let bootScanDone = false;
 
 /**
  * @param {import('discord.js').Client} client
@@ -33,9 +37,15 @@ export async function runScanTick(client, nowMs = Date.now(), options = {}) {
     logger.error('[Scan] 判断の反映に失敗しました', error);
   }
 
-  // ---- ② 走査（1日1回） ----
+  // ---- ② 走査（1日1回。SCAN_RUN_ON_BOOT=1 なら起動直後にも1回） ----
   if (scanning) return { decisions, skipped: 'already-scanning' };
-  if (!options.forceScan && !(await isScanDue(nowMs))) return { decisions };
+
+  const bootScan = config.scan.runOnBoot && !bootScanDone;
+  if (bootScan) {
+    bootScanDone = true;
+    logger.info('[Scan] SCAN_RUN_ON_BOOT=1 のため、時刻を待たずに起動直後の走査を行います');
+  }
+  if (!options.forceScan && !bootScan && !(await isScanDue(nowMs))) return { decisions };
 
   scanning = true;
   const date = jstDateString(nowMs);
@@ -46,20 +56,17 @@ export async function runScanTick(client, nowMs = Date.now(), options = {}) {
     //    失敗を翌日に持ち越さない（何度も投げ直してトークンを溶かさないため）。
     await markScanRun(date, result.ok ? 'ok' : 'failed', result.error);
 
-    if (!result.ok) {
-      await dmOwner(client, failureMessage(date, result.error));
-      return { decisions, scan: result };
-    }
-
-    // 候補が0件なら通知しない（毎朝「0件です」を送られても役に立たない）
-    if (result.candidates.length > 0) {
-      await dmOwner(client, candidatesMessage(date, result.candidates.length));
-    }
+    // ★ 成否によらず毎日1通、pm チャンネルに報告する。
+    //   「動いていること」が分かるのが目的なので、候補0件でも必ず送る。
+    await report(
+      client,
+      result.ok ? successMessage(nowMs, result) : failureMessage(nowMs, result.error, result),
+    );
     return { decisions, scan: result };
   } catch (error) {
     logger.error('[Scan] 走査に失敗しました', error);
     await markScanRun(date, 'failed', error.message);
-    await dmOwner(client, failureMessage(date, error.message));
+    await report(client, failureMessage(nowMs, error.message, null));
     return { decisions, scan: { ok: false, date, error: error.message } };
   } finally {
     scanning = false;
@@ -73,20 +80,90 @@ async function isScanDue(nowMs) {
   return state.lastScanDate !== jstDateString(nowMs);
 }
 
-/**
- * ⚠ 候補の中身はDMに書かない。判断はポータルでするものなので、
- *    Discordに内容を並べると「DMで判断した気になる」導線ができてしまう。
- */
-function candidatesMessage(date, count) {
-  const link = config.scan.portalUrl ? `\n${config.scan.portalUrl}` : '';
-  return `## 🔔 今日のタスク候補が ${count} 件あります\n\`\`\`\n${date} の会話から抽出しました。\nポータルで採否を判断してください。\n\`\`\`${link}`;
+// ---- 報告 -----------------------------------------------------------
+//
+// ⚠ オーナーへのDMは廃止した（2026-09-22 本人指示）。送り先は pm チャンネル1本。
+// ⚠ **メンションはしない**。毎日飛ぶので、鳴らすと通知が鬱陶しくなる。
+// ⚠ 候補の中身は書かない。判断はポータルでするものなので、
+//    Discordに内容を並べると「Discordで判断した気になる」導線ができてしまう。
+
+async function report(client, content) {
+  const channelId = config.scan.reportChannelId;
+  if (!channelId) {
+    logger.warn('[Scan] SCAN_REPORT_CHANNEL_ID が空なので、走査の報告を送れませんでした');
+    return false;
+  }
+  return postQuietly(client, channelId, content, []); // メンションなし
 }
 
-function failureMessage(date, error) {
-  return `## ❌ 会話の走査に失敗しました\n\`\`\`\n日付: ${date}\n理由: ${String(error || '不明').slice(0, 600)}\n\`\`\``;
+/** 走査レポート（毎日必ず送る。候補0件でも「候補 0件」と明記する） */
+function successMessage(nowMs, result) {
+  const stats = result.stats || {};
+  const lines = [
+    `実行     ${stamp(nowMs)}`,
+    `対象     ${stats.channels ?? 0}チャンネル / 発言 ${stats.quoted ?? 0}件`,
+    `候補     ${result.candidates.length}件（未判断）`,
+    `使用     ${modelLabel(config.scan.runnerModel)} / ジョブ ${stats.jobs ?? 0}本`,
+  ];
+  if (stats.truncatedChannels?.length) {
+    lines.push(`打切り   ${stats.truncatedChannels.join(', ')}（1回の取得上限に達しました）`);
+  }
+  if (stats.contentLooksDisabled) {
+    lines.push('⚠ 本文がすべて空でした。MESSAGE CONTENT Intent を確認してください');
+  }
+  return block('## 🔍 会話の走査を実行しました', lines);
+}
+
+function failureMessage(nowMs, error, result) {
+  const stats = result?.stats || {};
+  const lines = [
+    `実行     ${stamp(nowMs)}`,
+    `理由     ${String(error || '不明').replace(/\s+/g, ' ').slice(0, 400)}`,
+  ];
+  if (result) {
+    lines.push(`対象     ${stats.channels ?? 0}チャンネル / 発言 ${stats.quoted ?? 0}件`);
+    lines.push(`候補     ${result.candidates?.length ?? 0}件（ここまでの分は保存しました）`);
+    lines.push(`使用     ${modelLabel(config.scan.runnerModel)} / ジョブ ${stats.jobs ?? 0}本`);
+  }
+  return block('## ❌ 会話の走査に失敗しました', lines);
+}
+
+/** 見出し＋コードブロック（Discordは見出しもコードブロックも解釈する） */
+function block(heading, lines) {
+  const link = scansUrl();
+  const body = link ? [...lines, '', '; 判断はこちらから', link] : lines;
+  return `${heading}\n\`\`\`\n${body.join('\n')}\n\`\`\``;
+}
+
+/** PORTAL_PM_URL から走査一覧のURLを組み立てる。未設定なら省く */
+function scansUrl() {
+  const base = String(config.scan.portalUrl || '').trim().replace(/\/+$/, '');
+  if (!base) return '';
+  return base.endsWith('/scans') ? base : `${base}/scans`;
+}
+
+function stamp(nowMs) {
+  const p = jstParts(nowMs);
+  const z = (n) => String(n).padStart(2, '0');
+  return `${p.year}-${z(p.month)}-${z(p.day)} ${z(p.hour)}:${z(p.minute)}`;
+}
+
+/** モデル名を人が読む形に。知らない値はそのまま出す（嘘をつかない） */
+function modelLabel(model) {
+  const known = {
+    haiku: 'Claude Haiku 4.5',
+    sonnet: 'Claude Sonnet 4.5',
+    opus: 'Claude Opus 4.5',
+  };
+  return known[String(model || '').toLowerCase()] || String(model || '既定モデル');
 }
 
 /** テスト用: 走査中フラグを落とす */
 export function __resetScanning() {
   scanning = false;
+}
+
+/** テスト用: 起動直後の走査をもう一度「未実行」に戻す */
+export function __resetBootScan(pending = true) {
+  bootScanDone = !pending;
 }

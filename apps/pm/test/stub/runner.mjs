@@ -9,6 +9,9 @@ export function startStubRunner(queueDir, { bot = 'pm', respond } = {}) {
   const inbox = path.join(queueDir, bot, 'inbox');
   const result = path.join(queueDir, bot, 'result');
   const jobs = [];
+  // ⚠ 共有ドライブ上では unlink が一時的に失敗することがある。
+  //    そのまま次のポーリングで同じジョブを拾うと二重処理になるので、jobId で覚えておく。
+  const processed = new Set();
   let stopped = false;
 
   const timer = setInterval(async () => {
@@ -24,6 +27,8 @@ export function startStubRunner(queueDir, { bot = 'pm', respond } = {}) {
         job = JSON.parse(await fs.readFile(from, 'utf-8'));
       } catch { continue; }
       await fs.unlink(from).catch(() => {});
+      if (processed.has(job.jobId)) continue; // 消し損ねたファイルを拾い直しただけ
+      processed.add(job.jobId);
       jobs.push(job);
 
       const payload = await respond(job, jobs.length);

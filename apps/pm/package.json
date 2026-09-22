@@ -8,7 +8,9 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --import ./test/loader.mjs ./test/run.mjs",
-    "test:scan": "node --import ./test/loader.mjs ./test/scan.mjs"
+    "test:scan": "node --import ./test/loader.mjs ./test/scan.mjs",
+    "test:scan-backfill": "node --import ./test/loader.mjs ./test/scan-backfill.mjs",
+    "test:scan-boot-off": "node --import ./test/loader.mjs ./test/scan-boot-off.mjs"
   },
   "dependencies": {
     "discord.js": "^14.18.0",

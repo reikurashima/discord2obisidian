@@ -49,6 +49,12 @@ export async function selectChannels(guild) {
       excluded.push({ ...entry, channel: undefined, reason: 'PM Bot の通知先チャンネル' });
       continue;
     }
+    // ⚠ 走査レポートの投稿先は必ず外す（自分の通知を読み返して候補にしないため）。
+    //    設定漏れで事故らないよう、SCAN_EXCLUDE_CHANNEL_IDS とは別にコード側でも塞いでいる。
+    if (config.scan.reportChannelId && channel.id === config.scan.reportChannelId) {
+      excluded.push({ ...entry, channel: undefined, reason: 'PM Bot の走査レポート投稿先' });
+      continue;
+    }
     if (!canRead(channel, guild)) {
       excluded.push({ ...entry, channel: undefined, reason: '閲覧権限なし' });
       continue;
@@ -89,14 +95,24 @@ function canRead(channel, guild) {
  * 停止条件:
  *    - カーソルあり : カーソル以前のメッセージに到達したら止める（同じ発言を二度渡さない）
  *    - カーソルなし : 直近 SCAN_FIRST_RUN_HOURS 時間より古いものに到達したら止める
+ *                     （SCAN_FIRST_RUN_HOURS=0 なら期間の制限なし＝チャンネルの最初まで読む）
  *    - 共通         : 取得上限に達したら止める
+ *
+ * ★ バックフィル（カーソルなし かつ SCAN_FIRST_RUN_HOURS=0）のときだけ
+ *   1チャンネルの取得上限を外す。本人の指示「基本は直近24時間でいいけど、初回は全部やる」のため。
+ *   1ジョブが膨らまないようにするのは呼び出し側（scan.js）のジョブ分割の仕事。
+ *   ⚠ 期間の制限がある通常運用では、新しいチャンネルでも上限（既定200件）は必ず効かせる。
  *
  * @returns {Promise<{ messages: any[], newestId: string|null, hitLimit: boolean, fetched: number }>}
  */
 export async function fetchChannelMessages(channel, { cursorId, nowMs }) {
-  const limit = config.scan.maxMessagesPerChannel;
-  const cutoffMs = nowMs - config.scan.firstRunHours * 60 * 60 * 1000;
   const cursor = cursorId ? toSnowflake(cursorId) : null;
+  const backfill = cursor === null && config.scan.firstRunHours === 0;
+  const limit = backfill ? Infinity : config.scan.maxMessagesPerChannel;
+  // firstRunHours=0 は「期間の制限なし」。-Infinity にしておけば分岐を足さずに済む
+  const cutoffMs = config.scan.firstRunHours > 0
+    ? nowMs - config.scan.firstRunHours * 60 * 60 * 1000
+    : -Infinity;
 
   const collected = [];
   let newestId = null;

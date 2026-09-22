@@ -14,9 +14,18 @@ import { duplicatesExistingTask, fingerprint, normalizeTitle } from './dedupe.js
 
 // 1日1回の会話走査。
 //
-// ★ ジョブは **1日1本にまとめる**。
+// ★ 通常運用のジョブは **1日1本にまとめる**。
 //   claude-runner は1ジョブあたり約6,700トークンの固定オーバーヘッドがあるので、
 //   11チャンネルを別ジョブにすると、それだけで7万トークンを超えてしまう。
+//
+// ★ 例外は **初回バックフィル**（SCAN_FIRST_RUN_HOURS=0 で全期間を読むとき）と、
+//   発言が SCAN_MAX_MESSAGES_PER_JOB を超えたとき。
+//   このときだけジョブを分割し、**1本ずつ結果を待って順番に投げる**（runnerは直列実行）。
+//   候補はジョブをまたいでマージし、最後に scans/YYYY-MM-DD.json 1本にまとめる。
+//
+// ⚠ 途中のジョブが失敗したら、そこまでの候補は保存し、
+//   カーソルは **成功したジョブに含まれていたチャンネルぶんだけ** 進める。
+//   全部やり直しにならないようにするため。
 
 /**
  * 走査を1回実行する。
@@ -26,7 +35,7 @@ export async function runScan(client, nowMs = Date.now()) {
   const date = jstDateString(nowMs);
   const generated = jstIsoString(nowMs);
   const stats = {
-    channels: 0, excluded: 0, messages: 0, quoted: 0, jobs: 0,
+    channels: 0, excluded: 0, messages: 0, quoted: 0, jobs: 0, jobsPlanned: 0,
     rawCandidates: 0, droppedDuplicate: 0, droppedIgnored: 0, droppedUnmatched: 0,
     contentLooksDisabled: false, truncatedChannels: [],
   };
@@ -41,10 +50,11 @@ export async function runScan(client, nowMs = Date.now()) {
 
   // ---- ① 前回の続きから発言を集める ----
   const cursors = await readCursors();
-  const quoted = [];
+  const items = [];               // Claudeに渡す発言。チャンネル順・チャンネル内は時系列
   const sources = new Map();      // messageId → { channelId, channelName, text, author, postedAt }
-  const channelRanges = [];       // 引用の何番から何番がどのチャンネルか（Claudeに渡す）
-  const cursorUpdates = {};
+  const cursorUpdates = {};       // すぐ進めてよいカーソル（Claudeに渡す発言が無かったチャンネル）
+  // ジョブ待ちのカーソル。そのチャンネルの発言を含むジョブが全部成功してから進める
+  const pendingCursors = [];      // { channelId, newestId, lastItemIndex }
   let humanTotal = 0;
   let emptyTotal = 0;
 
@@ -59,7 +69,6 @@ export async function runScan(client, nowMs = Date.now()) {
       continue;
     }
 
-    if (fetched.newestId) cursorUpdates[target.id] = fetched.newestId;
     if (fetched.hitLimit) stats.truncatedChannels.push(target.name);
 
     const { picked, emptyCount, humanCount } = pickMessages(fetched.messages, client.user?.id);
@@ -67,19 +76,27 @@ export async function runScan(client, nowMs = Date.now()) {
     emptyTotal += emptyCount;
     warnEmptyContent(target.name, { humanCount, emptyCount });
     stats.messages += fetched.messages.length;
-    if (picked.length === 0) continue;
 
-    const from = quoted.length + 1;
+    if (picked.length === 0) {
+      // Claudeに渡すものが無いチャンネルは、ジョブの成否と関係ないので今すぐ進めてよい
+      if (fetched.newestId) cursorUpdates[target.id] = fetched.newestId;
+      continue;
+    }
+
     for (const message of picked) {
       const postedAt = new Date(message.createdTimestamp ?? Date.now()).toISOString();
       const author = displayNameOf(message);
       const text = String(message.content).trim();
 
-      quoted.push({
-        source: `discord:${message.id}`,
-        author,
-        text,
-        postedAt,
+      items.push({
+        channelId: target.id,
+        channelName: target.name,
+        quote: {
+          source: `discord:${message.id}`,
+          author,
+          text,
+          postedAt,
+        },
       });
       sources.set(String(message.id), {
         messageId: String(message.id),
@@ -90,70 +107,95 @@ export async function runScan(client, nowMs = Date.now()) {
         postedAt,
       });
     }
-    channelRanges.push({
-      id: target.id, name: target.name, quote_from: from, quote_to: quoted.length,
-    });
+    if (fetched.newestId) {
+      pendingCursors.push({
+        channelId: target.id,
+        newestId: fetched.newestId,
+        lastItemIndex: items.length - 1,
+      });
+    }
   }
 
-  stats.quoted = quoted.length;
+  stats.quoted = items.length;
   stats.contentLooksDisabled = warnIfContentLooksDisabled({
-    humanCount: humanTotal, emptyCount: emptyTotal, pickedCount: quoted.length,
+    humanCount: humanTotal, emptyCount: emptyTotal, pickedCount: items.length,
   });
 
   // カーソルは「Claudeに渡したかどうか」に関係なく進める。
   // Botの投稿しか無かったチャンネルを毎回読み直しても意味が無いため。
   await advanceCursors(cursorUpdates, generated);
 
-  if (quoted.length === 0) {
+  if (items.length === 0) {
     logger.info('[Scan] 新しい発言がありませんでした（候補なし）');
     // ⚠ 空で上書きしない。同じ日に既に判断済みの候補があれば必ず残す
     await persistCandidates(date, generated, [], stats);
     return { ok: true, date, candidates: [], stats };
   }
 
-  // ---- ② claude-runner に1本だけ投げる ----
+  // ---- ② claude-runner に投げる（通常は1本／多すぎるときだけ分割して順番に） ----
   const openTasks = await listOpenTasks();
   const runner = createRunnerClient({ queueDir: config.scan.runnerQueueDir, bot: 'pm' });
 
-  const job = {
-    kind: 'digest.extract',
-    outputSchema: 'digest.v1',
-    model: config.scan.runnerModel,
-    timeoutSec: Math.floor(config.scan.jobTimeoutMs / 1000),
-    input: {
-      scan_date: date,
-      guild_id: config.discord.guildId,
-      // 引用[n] がどのチャンネルの発言かの対応表。channel_id はここから選ぶこと
-      channels: channelRanges,
-      // 既に登録済みのタスク。これと同じ内容は候補にしない
-      existing_tasks: openTasks.map((t) => ({ title: t.title, assignee_name: t.assigneeName })),
-      notes: [
-        'channels[] の quote_from / quote_to は、引用ブロックの [n] 番号の範囲です。',
-        'candidates[].channel_id / channel_name は、その発言が属するチャンネルのものを使ってください。',
-        'evidence.text は引用の文言をそのまま写してください（依頼側が発言を特定するのに使います）。',
-        'evidence.message_url は null のままで構いません（依頼側が組み立てます）。',
-        'existing_tasks と同じ内容は候補にしないでください。',
-      ],
-    },
-    quoted,
-  };
-
-  stats.jobs = 1;
-  logger.info(`[Scan] runner にジョブを1本投げます（引用 ${quoted.length} 件 / ${channelRanges.length}ch）`);
-
-  const result = await runner.runJob(job, {
-    timeoutMs: config.scan.jobTimeoutMs,
-    intervalMs: config.scan.jobPollIntervalMs,
-  });
-
-  if (result.status !== 'ok' || !result.output) {
-    const reason = `${result.errorCode || result.status}: ${String(result.logTail || '').slice(0, 300)}`;
-    logger.error(`[Scan] runner のジョブが失敗しました — ${reason}`);
-    return { ok: false, date, candidates: [], stats, error: reason };
+  const chunks = chunkItems(items, config.scan.maxMessagesPerJob);
+  stats.jobsPlanned = chunks.length;
+  if (chunks.length > 1) {
+    logger.info(
+      `[Scan] 発言 ${items.length} 件 → 1ジョブ ${config.scan.maxMessagesPerJob} 件ずつ`
+      + ` ${chunks.length} 本のジョブに分けて順番に投げます（バックフィル）`,
+    );
   }
 
-  // ---- ③ 結果を契約の形に整える ----
-  const raw = Array.isArray(result.output.candidates) ? result.output.candidates : [];
+  const raw = [];
+  let failure = null;
+  let flushedCursors = 0; // pendingCursors のうち、どこまでカーソルを進めたか
+
+  for (let i = 0; i < chunks.length; i += 1) {
+    const chunk = chunks[i];
+    if (chunks.length > 1) {
+      logger.info(
+        `[Scan] バックフィル ${i + 1}/${chunks.length} ジョブ目`
+        + `（引用 ${chunk.items.length} 件 / ${chunk.channels.length}ch）`,
+      );
+    } else {
+      logger.info(`[Scan] runner にジョブを1本投げます（引用 ${chunk.items.length} 件 / ${chunk.channels.length}ch）`);
+    }
+
+    stats.jobs += 1;
+    // ⚠ runner は直列実行。1本ずつ結果を待ってから次を投げる（並行に投げない）
+    const result = await runner.runJob(
+      buildJob({ date, chunk, openTasks }),
+      { timeoutMs: config.scan.jobTimeoutMs, intervalMs: config.scan.jobPollIntervalMs },
+    );
+
+    if (result.status !== 'ok' || !result.output) {
+      failure = `${result.errorCode || result.status}: ${String(result.logTail || '').slice(0, 300)}`;
+      logger.error(
+        `[Scan] runner のジョブが失敗しました（${i + 1}/${chunks.length} ジョブ目）— ${failure}`,
+      );
+      break;
+    }
+
+    const got = Array.isArray(result.output.candidates) ? result.output.candidates : [];
+    raw.push(...got);
+    if (chunks.length > 1) {
+      logger.info(`[Scan] バックフィル ${i + 1}/${chunks.length} ジョブ目 完了（候補 ${got.length} 件 / 累計 ${raw.length} 件）`);
+    }
+
+    // ★ 成功したぶんだけカーソルを進める。
+    //   次のジョブが落ちても、ここまでのチャンネルは二度読みしない。
+    const done = {};
+    while (
+      flushedCursors < pendingCursors.length
+      && pendingCursors[flushedCursors].lastItemIndex <= chunk.endIndex
+    ) {
+      const entry = pendingCursors[flushedCursors];
+      done[entry.channelId] = entry.newestId;
+      flushedCursors += 1;
+    }
+    // ジョブごとに確実に書き切る（途中で落ちても成功分は残る）
+    await advanceCursors(done, generated);
+  }
+
   stats.rawCandidates = raw.length;
 
   const ignored = await readIgnoredFingerprints();
@@ -191,13 +233,77 @@ export async function runScan(client, nowMs = Date.now()) {
     shapedList.push({ ...shaped, fp, source });
   }
 
+  // ⚠ 失敗していても、ここまでに得た候補は必ず保存する（全部やり直しにしない）
   const candidates = await persistCandidates(date, generated, shapedList, stats);
   logger.info(
     `[Scan] ${date} 候補 ${candidates.length} 件`
     + `（Claudeの出力 ${stats.rawCandidates} 件 / 重複 ${stats.droppedDuplicate} / 却下済み ${stats.droppedIgnored} / 根拠不明 ${stats.droppedUnmatched}）`,
   );
 
+  if (failure) {
+    const reason = stats.jobsPlanned > 1
+      ? `${stats.jobs}/${stats.jobsPlanned} ジョブ目で失敗 — ${failure}`
+      : failure;
+    logger.warn(
+      `[Scan] 途中で失敗しましたが、候補 ${candidates.length} 件は保存しました。`
+      + ` カーソルは成功した ${stats.jobs - 1} 本ぶんだけ進めています`,
+    );
+    return { ok: false, date, candidates, stats, error: reason };
+  }
+
   return { ok: true, date, candidates, stats };
+}
+
+/**
+ * 発言を1ジョブぶんずつに切り分ける。
+ * 引用の [n] 番号はジョブごとに 1 から振り直すので、channels[] の範囲もジョブ内の番号で作る。
+ * @returns {Array<{ items: any[], channels: any[], endIndex: number }>}
+ */
+function chunkItems(items, size) {
+  const chunks = [];
+  for (let start = 0; start < items.length; start += size) {
+    const slice = items.slice(start, start + size);
+    const channels = [];
+    slice.forEach((item, i) => {
+      const last = channels[channels.length - 1];
+      // items はチャンネル順に並んでいるので、隣と同じチャンネルなら範囲を伸ばすだけでよい
+      if (last && last.id === item.channelId) {
+        last.quote_to = i + 1;
+        return;
+      }
+      channels.push({
+        id: item.channelId, name: item.channelName, quote_from: i + 1, quote_to: i + 1,
+      });
+    });
+    chunks.push({ items: slice, channels, endIndex: start + slice.length - 1 });
+  }
+  return chunks;
+}
+
+/** ジョブ1本ぶんの中身。分割しても形は変えない（runner との約束） */
+function buildJob({ date, chunk, openTasks }) {
+  return {
+    kind: 'digest.extract',
+    outputSchema: 'digest.v1',
+    model: config.scan.runnerModel,
+    timeoutSec: Math.floor(config.scan.jobTimeoutMs / 1000),
+    input: {
+      scan_date: date,
+      guild_id: config.discord.guildId,
+      // 引用[n] がどのチャンネルの発言かの対応表。channel_id はここから選ぶこと
+      channels: chunk.channels,
+      // 既に登録済みのタスク。これと同じ内容は候補にしない
+      existing_tasks: openTasks.map((t) => ({ title: t.title, assignee_name: t.assigneeName })),
+      notes: [
+        'channels[] の quote_from / quote_to は、引用ブロックの [n] 番号の範囲です。',
+        'candidates[].channel_id / channel_name は、その発言が属するチャンネルのものを使ってください。',
+        'evidence.text は引用の文言をそのまま写してください（依頼側が発言を特定するのに使います）。',
+        'evidence.message_url は null のままで構いません（依頼側が組み立てます）。',
+        'existing_tasks と同じ内容は候補にしないでください。',
+      ],
+    },
+    quoted: chunk.items.map((item) => item.quote),
+  };
 }
 
 // ---- 書き出し -------------------------------------------------------
