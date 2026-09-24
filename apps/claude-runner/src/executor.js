@@ -12,18 +12,11 @@ import { logger } from './utils/logger.js';
  */
 export function createClaudeExecutor(config) {
   return async function claudeExecutor(task) {
-    const {
-      prompt, cwd, outDir, kindDef, model, timeoutSec,
-    } = task;
-
-    const args = ['-p', '--output-format', 'json'];
-    args.push(...buildToolArgs(kindDef, outDir));
-    // model はジョブ任意。未指定ならモデル指定なし（既定に任せる）
-    if (model) args.push('--model', model);
+    const { prompt, cwd, timeoutSec } = task;
 
     return runProcess({
       bin: config.claudeBin,
-      args,
+      args: buildClaudeArgs(task),
       cwd,
       stdin: prompt,
       timeoutMs: timeoutSec * 1000,
@@ -31,6 +24,21 @@ export function createClaudeExecutor(config) {
       env: buildChildEnv(process.env),
     });
   };
+}
+
+/**
+ * `claude` に渡す引数（プロンプトは stdin なので含まない）。
+ * 検証で「実際にどういうツール制限で起動するか」を出力できるよう切り出してある。
+ */
+export function buildClaudeArgs({
+  cwd, outDir, kindDef, model,
+}) {
+  const args = ['-p', '--output-format', 'json'];
+  // cwd = /work/<jobId>。tools: 'workdir-read' の許可範囲はここに絞られる
+  args.push(...buildToolArgs(kindDef, outDir, cwd));
+  // model はジョブ任意。未指定ならモデル指定なし（既定に任せる）
+  if (model) args.push('--model', model);
+  return args;
 }
 
 /**

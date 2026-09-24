@@ -49,6 +49,13 @@ export function loadConfig(env = process.env) {
 
     // logTail に残す文字数（要件: 末尾2000文字まで）
     logTailChars: toInt(env.LOG_TAIL_CHARS, 2000),
+
+    // 添付ファイル（files/）1件あたりの上限。超えたら rejected（既定 20MB）
+    maxAttachmentBytes: toInt(env.MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024),
+
+    // 対応するジョブが無い files/ の中身を「孤児」とみなして消すまでの猶予（既定 1時間）。
+    // ⚠ 依頼側は「PDFを置く → JSONを置く」の順なので、その隙間で消さないよう猶予を持たせる
+    orphanFileAgeMs: toInt(env.ORPHAN_FILE_AGE_MS, 60 * 60 * 1000),
   };
 }
 

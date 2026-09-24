@@ -2,7 +2,9 @@ import { loadConfig } from './config.js';
 import { createClaudeExecutor } from './executor.js';
 import { createHealthMonitor } from './health.js';
 import { createRunner } from './runner.js';
-import { ensureQueueDirs, purgeOldFiles, recoverStaleProcessing } from './queue.js';
+import {
+  ensureQueueDirs, purgeOldFiles, purgeOrphanFiles, recoverStaleProcessing,
+} from './queue.js';
 import { logger } from './utils/logger.js';
 
 const config = loadConfig();
@@ -40,8 +42,11 @@ async function main() {
   await recoverStaleProcessing(config);
 
   await purgeOldFiles(config);
+  // ⚠ 添付（請求書PDFなど機微情報）の取り残しを消す。回収処理の後に呼ぶこと
+  await purgeOrphanFiles(config);
   const purgeTimer = setInterval(() => {
     purgeOldFiles(config).catch((e) => logger.error('[Queue] purge failed', e));
+    purgeOrphanFiles(config).catch((e) => logger.error('[Files] orphan purge failed', e));
   }, config.purgeIntervalMs);
   purgeTimer.unref?.();
 

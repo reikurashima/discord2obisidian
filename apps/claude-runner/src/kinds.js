@@ -1,3 +1,5 @@
+import path from 'path';
+import { validateAttachmentList } from './attachments.js';
 import { schemaNames } from './schemas/index.js';
 
 // ---- 依頼できる Bot（ホワイトリスト） ---------------------------------
@@ -12,9 +14,16 @@ export const BOTS = ['pm', 'portal'];
 //    （runner 自身は副作用を持たない設計なので、out/ の中身も依頼側が拾って使う）
 //
 // tools:
-//   'none'  … ツールを一切使わせない（文章生成だけ。いちばん安全）
-//   'read'  … 読み取り系のみ
+//   'none'         … ツールを一切使わせない（文章生成だけ。いちばん安全）
+//   'read'         … 読み取り系のみ
+//   'workdir-read' … Read だけ。しかも作業ディレクトリ（/work/<jobId>/）の中だけ（添付PDFを読む用）
 // write: true … 上記に加えて /work/<jobId>/out/ への書き込みを許す
+// bots:        … この kind を依頼できる bot。省略時は BOTS 全部（既存の kind の挙動を変えないため）
+// attachments: … 'required' = 添付（["<jobId>.pdf"] の1件）必須 / 'allowed' = 任意 / 省略 = 添付を受け付けない
+// instructions … kind 固有の作業手順（プロンプトの「作業の手順」に入る。省略可）
+// redactLogs: true … 生の出力（claude の stdout/stderr・解析結果・ジョブの input）を
+//              result の logTail と failed/ に残さない。残すのはエラーコードと「どの項目で落ちたか」だけ。
+//              機微情報（請求書の取引先・口座・金額）を 14日間ディスクに置かないため
 
 const KINDS = {
   // 疎通確認。input.text をそのまま返させるだけ
@@ -36,6 +45,34 @@ const KINDS = {
       '雑談・感想・完了報告は候補にしません。推測で人名や期限を補わないでください。',
     ].join('\n'),
   },
+
+  // 請求書PDF（外注先から届いたもの）から会計用の項目を読み取る（マイポータル用）
+  // ⚠ 請求書は機微情報。読めるのは作業ディレクトリにコピーした添付だけにする
+  'invoice.extract': {
+    bots: ['portal'],
+    tools: 'workdir-read',
+    write: false,
+    attachments: 'required',
+    redactLogs: true,
+    outputSchemas: ['invoice.v1'],
+    role: [
+      'あなたは日本語の請求書（PDF）から会計用の項目を読み取る抽出エンジンです。',
+      '請求書に**実際に書かれている値だけ**を読み取ります。読み取れない項目・書かれていない項目は推測せず null にします。',
+    ].join('\n'),
+    instructions: [
+      '添付の請求書PDFを Read ツールで開いて読むこと。スキャン画像のPDFもあるので、その場合は画像として文字を読み取ること。',
+      '**読み取れない項目・書かれていない項目は推測せず null にすること。** 他の値からの計算（例: 税抜から税額を割り出す）で埋めないこと。',
+      '**⚠ ファイル名（input.fileName）は手がかりにすぎない。ファイル名に含まれる日付（例: 先頭の「0815」）は、請求書の発行日・支払期日とは限らない。**'
+        + '日付は必ずPDF本文から読み取り、本文に無ければ null にすること。ファイル名から日付を埋めないこと。',
+      '日付は西暦の YYYY-MM-DD にすること（和暦は西暦に直す。例: 令和8年 = 2026年）。年が本文から確定できない日付は null にすること。',
+      '金額は円単位の整数にすること（カンマ・円記号・「円」を付けない。例: 110000）。',
+      'amount_incl は**源泉徴収を差し引く前の**税込の請求額。「差引ご請求額」「お振込金額」など源泉徴収後の額を入れないこと。',
+      'withholding は源泉徴収税額。記載が無ければ null。',
+      'issuer_name は請求元（この請求書を発行した側＝外注先）。宛先（「御中」「様」が付く請求先）と取り違えないこと。',
+      'invoice_number は適格請求書発行事業者の登録番号（T＋13桁の数字）。請求書番号（No. 等）と混同しないこと。無ければ null。',
+      'project_hint は件名・案件名。無ければ null。',
+    ],
+  },
 };
 
 export function getKind(kind) {
@@ -44,6 +81,14 @@ export function getKind(kind) {
 
 export function kindNames() {
   return Object.keys(KINDS);
+}
+
+/**
+ * その kind が生の出力を残さない（redactLogs）対象か。
+ * ⚠ ジョブが rejected でも kind 名さえ分かれば判定する（pm から invoice.extract が来た場合など）
+ */
+export function isRedactedKind(kind) {
+  return getKind(kind)?.redactLogs === true;
 }
 
 // 読み取り系として許すツール。
@@ -56,13 +101,51 @@ const READ_TOOLS = ['Read', 'Glob', 'Grep'];
 // 危険なものは名指しでも落としておく（二重の網）。
 const DENY_TOOLS = ['Bash', 'WebFetch', 'WebSearch', 'Task', 'NotebookEdit'];
 
+// tools: 'workdir-read' のときに追加で拒否するもの。
+// ⚠ Read 以外の読み取り系（Glob / Grep / LS）も落とす。「Read だけ」を文字どおりにするため。
+const WORKDIR_READ_DENY_TOOLS = [
+  'Glob', 'Grep', 'LS', 'Write', 'Edit', 'MultiEdit', 'NotebookRead',
+];
+
+// tools: 'workdir-read' のときに Read を拒否する場所（コンテナ内の絶対パス）。
+//
+// ⚠⚠ 二重の網。1枚目は「cwd を作業ディレクトリにする」「許可を作業ディレクトリに絞る」。
+//    ただし許可側のパス指定構文が実機で効くかは確かめられていない（認証が無く claude を実行できない）。
+//    また Claude Code は読み取り系ツールを既定で許していることがあるため、
+//    許可側だけに頼ると「作業ディレクトリの外も読めてしまう」恐れがある。
+//    そこで拒否側で、読まれて困る場所を名指しで塞ぐ（拒否は許可より優先される）。
+//      /root  … claude の認証情報（/root/.claude）
+//      /queue … 他のジョブ・他の bot のデータ、他の請求書PDF
+//      /app   … runner 自身のソース
+//      /etc /proc /sys … 環境変数・秘密情報の取り出し口
+//    ⚠ /work は塞げない（作業ディレクトリがその下にあり、拒否が優先されてしまうため）。
+//      runner は1プロセス直列なので、/work の下に他のジョブが同時に居ることは無い。
+const WORKDIR_READ_DENY_PATHS = [
+  '/root', '/queue', '/app', '/etc', '/proc', '/sys', '/home', '/var', '/tmp', '/usr', '/opt', '/run', '/dev',
+];
+
 /**
  * kind と作業ディレクトリから `claude -p` に渡すツール制限の引数を組み立てる。
  * outDir は /work/<jobId>/out（このパス配下だけ書き込みを許す）
+ * workDir は /work/<jobId>（tools: 'workdir-read' のときだけ使う。省略時は outDir の親）
  */
-export function buildToolArgs(kindDef, outDir) {
+export function buildToolArgs(kindDef, outDir, workDir = path.posix.dirname(toPosix(outDir))) {
   const allowed = [];
+  const denied = [...DENY_TOOLS];
   if (kindDef.tools === 'read') allowed.push(...READ_TOOLS);
+  if (kindDef.tools === 'workdir-read') {
+    const wd = toPosix(workDir);
+    // 許可は作業ディレクトリの中の Read だけ。
+    // ⚠ パス規則の書き方が2通りある（`./` = cwd 相対 / `//` = ルートからの絶対パス）。
+    //    どちらが CLI で効くか実機未確認なので両方書く。どちらも作業ディレクトリの中しか指さない
+    allowed.push('Read(./**)', `Read(/${wd}/**)`);
+    denied.push(...WORKDIR_READ_DENY_TOOLS);
+    for (const p of WORKDIR_READ_DENY_PATHS) {
+      // 同じく2通りで書く（`//x` = 絶対パス / `/x` = 解釈違いでも害のない側に倒れる）
+      denied.push(`Read(/${p}/**)`, `Read(${p}/**)`);
+    }
+    denied.push('Read(~/**)');
+  }
   if (kindDef.write) {
     // パス指定つきで許可する。out/ の外へは書けない
     allowed.push(`Write(${outDir}/**)`, `Edit(${outDir}/**)`);
@@ -72,8 +155,13 @@ export function buildToolArgs(kindDef, outDir) {
   // ⚠ tools: 'none' のときは --allowedTools に空文字を渡す。
   //    引数ごと省くと既定の許可セットが効いてしまうため、必ず明示する。
   args.push('--allowedTools', allowed.join(','));
-  args.push('--disallowedTools', DENY_TOOLS.join(','));
+  args.push('--disallowedTools', denied.join(','));
   return args;
+}
+
+/** Windows で検証するときも、ルールには POSIX 形式のパスを書く（本番は Linux） */
+function toPosix(p) {
+  return String(p).replace(/\\/g, '/');
 }
 
 export function validateJobShape(job, fileName, laneBot) {
@@ -100,6 +188,11 @@ export function validateJobShape(job, fileName, laneBot) {
   if (!kindDef) {
     return { errorCode: 'UNKNOWN_KIND', errors: [`kind "${job.kind}" is not allowed (allowed: ${kindNames().join(', ')})`] };
   }
+  // kind ごとの bot ホワイトリスト。
+  // ⚠ 請求書のように機微な kind を、関係ない bot（pm）から使わせない
+  if (kindDef.bots && !kindDef.bots.includes(job.bot)) {
+    return { errorCode: 'UNKNOWN_KIND', errors: [`kind "${job.kind}" is not allowed for bot "${job.bot}" (allowed bots: ${kindDef.bots.join(', ')})`] };
+  }
   if (!schemaNames().includes(job.outputSchema)) {
     return { errorCode: 'UNKNOWN_SCHEMA', errors: [`outputSchema "${job.outputSchema}" is not defined (defined: ${schemaNames().join(', ')})`] };
   }
@@ -113,6 +206,16 @@ export function validateJobShape(job, fileName, laneBot) {
   }
   if (job.quoted !== undefined && !Array.isArray(job.quoted)) {
     errors.push('quoted must be an array when present');
+  }
+  // 添付。名前の形（パストラバーサル対策）はここで弾く。ファイルの有無は runner が見る
+  // ⚠ 許すのは ["<jobId>.pdf"] の1件だけ（他のジョブの添付を指させない）
+  errors.push(...validateAttachmentList(job.attachments, job.jobId));
+  const attachmentCount = Array.isArray(job.attachments) ? job.attachments.length : 0;
+  if (!kindDef.attachments && attachmentCount > 0) {
+    errors.push(`kind "${job.kind}" does not accept attachments`);
+  }
+  if (kindDef.attachments === 'required' && attachmentCount === 0) {
+    errors.push(`kind "${job.kind}" requires at least one attachment`);
   }
   if (errors.length > 0) return { errorCode: 'BAD_JOB', errors };
 

@@ -1,7 +1,12 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import { BOTS } from './kinds.js';
-import { ensureDir, listJsonFiles, writeJson } from './utils/fsx.js';
+import {
+  attachmentNameFor, cleanupNames, deleteAttachments, filesDir,
+} from './attachments.js';
+import { BOTS, isRedactedKind } from './kinds.js';
+import {
+  ensureDir, listJsonFiles, readJson, writeJson,
+} from './utils/fsx.js';
 import { logger } from './utils/logger.js';
 
 export const LANES = ['inbox', 'processing', 'result', 'failed'];
@@ -20,6 +25,8 @@ export async function ensureQueueDirs(config) {
     for (const lane of LANES) {
       await ensureDir(laneDir(config, bot, lane));
     }
+    // 添付ファイル置き場。ジョブではないので LANES には入れない（queueDepth の対象外）
+    await ensureDir(filesDir(config, bot));
   }
   await ensureDir(config.workDir);
   logger.info(`[Queue] Ready: ${config.queueDir} (bots: ${BOTS.join(', ')})`);
@@ -117,13 +124,54 @@ export async function moveToFailed(config, bot, fileName, rawError) {
     if (error.code !== 'ENOENT') logger.warn(`[Queue] failed to move ${fileName} to failed/: ${error.message}`);
   }
   await clearClaimMarker(config, bot, fileName);
+  // ⚠ 機微な kind（redactLogs）は、failed/ に残すジョブ本体からも input / quoted を抜く
+  const redacted = await redactFailedJob(to);
   if (rawError) {
     // ⚠ 認証切れの判定ロジックは実機で確かめてから詰める。
     //    それまでは「生のエラー出力をそのまま残す」ことを優先する
+    //    （ただし redactLogs の kind は例外。生の出力を書かない。runner 側でも絞っているが、ここでも念を押す）
     const errPath = path.join(laneDir(config, bot, 'failed'), `${fileName.replace(/\.json$/, '')}.error.json`);
-    try { await writeJson(errPath, rawError); } catch (e) { logger.warn(`[Queue] could not write error dump: ${e.message}`); }
+    const dump = redacted ? pickSafeRawError(rawError) : rawError;
+    try { await writeJson(errPath, dump); } catch (e) { logger.warn(`[Queue] could not write error dump: ${e.message}`); }
   }
   return to;
+}
+
+// redactLogs の kind で failed/*.error.json に残してよいキー（値そのものを含まないものだけ）。
+// ⚠ stdout / stderr / parsed / job は含めない（請求書の中身・ファイル名が入るため）
+const SAFE_RAW_KEYS = [
+  'redacted', 'errorCode', 'detail', 'exitCode', 'signal', 'timedOut', 'timeoutSec', 'argv',
+  'authMatched', 'parseReason', 'schemaErrors', 'rejected', 'attachment', 'attachments',
+  'execThrow', 'prepareThrow', 'stack', 'interrupted',
+];
+
+export function pickSafeRawError(rawError) {
+  const out = { redacted: true };
+  for (const k of SAFE_RAW_KEYS) {
+    if (rawError && k in rawError) out[k] = rawError[k];
+  }
+  return out;
+}
+
+/**
+ * failed/ に移したジョブ本体が redactLogs の kind なら、input と quoted を中身なしに差し替える。
+ * （invoice.extract の input.fileName には取引先名が入ることがあるため）
+ * @returns {Promise<boolean>} redactLogs の kind だったか
+ */
+async function redactFailedJob(failedPath) {
+  const job = await readJson(failedPath).catch(() => null);
+  if (!job || typeof job !== 'object' || !isRedactedKind(job.kind)) return false;
+  const safe = { ...job, redacted: true };
+  if ('input' in safe) {
+    safe.input = { redacted: true, keys: isObj(job.input) ? Object.keys(job.input) : [] };
+  }
+  if ('quoted' in safe) safe.quoted = { redacted: true, count: Array.isArray(job.quoted) ? job.quoted.length : 0 };
+  try { await writeJson(failedPath, safe); } catch (e) { logger.warn(`[Queue] could not redact ${failedPath}: ${e.message}`); }
+  return true;
+}
+
+function isObj(v) {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
 /** 正常終了したジョブ本体を processing/ から消す */
@@ -160,6 +208,8 @@ export async function recoverStaleProcessing(config) {
         finishedAt: now,
       });
       await moveToFailed(config, bot, fileName, null);
+      // ⚠ 再実行しないジョブの添付は、機微情報なのでここで消す
+      await deleteAttachments(config, bot, cleanupNames(jobId));
       recovered.push(`${bot}/${fileName}`);
     }
     // 取りこぼした排他マーカー（Windows用）も掃除しておく
@@ -196,6 +246,47 @@ export async function purgeOldFiles(config, now = Date.now()) {
     }
   }
   if (removed.length > 0) logger.info(`[Queue] purged ${removed.length} file(s) older than ${config.retentionDays} days`);
+  return removed;
+}
+
+/**
+ * files/ の孤児（対応するジョブが inbox / processing に無い添付）を消す。起動時＋日次。
+ *
+ * 「対応するジョブ」= inbox / processing にある、jobId がファイル名の拡張子前と一致するジョブ
+ *   （添付は `<jobId>.pdf` の1件だけという契約なので、名前だけで突き合わせられる）。
+ * ⚠ 置かれてから orphanFileAgeMs 未満のものは消さない。
+ *   依頼側は「PDFを置く → JSONを置く」の順なので、その隙間で消すと ATTACHMENT_MISSING になる。
+ * ⚠ 対応するジョブがあるものは、どれだけ古くても消さない（inbox で順番待ちの場合があるため）。
+ */
+export async function purgeOrphanFiles(config, now = Date.now()) {
+  const removed = [];
+  for (const bot of BOTS) {
+    const dir = filesDir(config, bot);
+    let names;
+    try { names = await fs.readdir(dir); } catch { continue; }
+    if (names.length === 0) continue;
+
+    const referenced = new Set();
+    for (const lane of ['inbox', 'processing']) {
+      for (const fileName of await listJsonFiles(laneDir(config, bot, lane))) {
+        referenced.add(attachmentNameFor(fileName.replace(/\.json$/, '')));
+      }
+    }
+
+    for (const name of names) {
+      if (referenced.has(name)) continue;
+      const p = path.join(dir, name);
+      try {
+        const st = await fs.lstat(p);
+        // ディレクトリは触らない（誰かが意図して置いたものかもしれない）。ファイルとリンクだけ
+        if (st.isDirectory()) continue;
+        if (now - st.mtimeMs < config.orphanFileAgeMs) continue;
+        await fs.unlink(p);
+        removed.push(`${bot}/files/${name}`);
+      } catch { /* 読めない・消せないものは触らない */ }
+    }
+  }
+  if (removed.length > 0) logger.warn(`[Files] purged ${removed.length} orphan file(s): ${removed.join(', ')}`);
   return removed;
 }
 

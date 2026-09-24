@@ -29,6 +29,8 @@ export function createRunnerClient({ queueDir, bot, healthFile } = {}) {
     processing: path.join(queueDir, bot, 'processing'),
     result: path.join(queueDir, bot, 'result'),
     failed: path.join(queueDir, bot, 'failed'),
+    // 添付ファイル置き場。⚠ ジョブJSONより**先に**置くこと（runner はJSONが見えた時点で読みに来る）
+    files: path.join(queueDir, bot, 'files'),
   };
   const healthPath = healthFile || path.join(queueDir, 'health.json');
 
@@ -48,7 +50,7 @@ export function createRunnerClient({ queueDir, bot, healthFile } = {}) {
    *   直接書くと、runner が「書き込み途中のJSON」を拾って壊れたジョブとして弾いてしまう。
    */
   async function submitJob({
-    kind, input = {}, quoted = [], outputSchema, model, timeoutSec, jobId,
+    kind, input = {}, quoted = [], outputSchema, model, timeoutSec, jobId, attachments,
   }) {
     if (!kind) throw new Error('submitJob: kind is required');
     if (!outputSchema) throw new Error('submitJob: outputSchema is required');
@@ -65,6 +67,8 @@ export function createRunnerClient({ queueDir, bot, healthFile } = {}) {
       outputSchema,
     };
     if (model) job.model = model;
+    // 添付は files/ に置いたファイル名（例: `<jobId>.pdf`）。置くのは呼び出し側の責任
+    if (attachments !== undefined) job.attachments = attachments;
 
     await fs.mkdir(dirs.inbox, { recursive: true });
     const finalPath = path.join(dirs.inbox, `${id}.json`);

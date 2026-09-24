@@ -30,6 +30,9 @@ export function createExecutor(config) {
       mode: spec.mode,
       // 子プロセスに渡るはずの env から APIキーが消えているかを記録する
       apiKeyInParent: process.env.ANTHROPIC_API_KEY ?? null,
+      // 実行時点で作業ディレクトリに何があったか（添付のコピーの確認用）
+      cwdFiles: await listWithSizes(task.cwd),
+      attachments: (task.attachments || []).map((a) => ({ name: a.name, path: a.path, size: a.size })),
     });
 
     if (spec.mode === 'throw') throw new Error('stub executor exploded');
@@ -67,6 +70,18 @@ export function createExecutor(config) {
       code: 0, signal: null, stdout: JSON.stringify(envelope), stderr: '', timedOut: false, argv: ['stub'],
     };
   };
+}
+
+async function listWithSizes(dir) {
+  try {
+    const names = (await fs.readdir(dir)).sort();
+    const out = {};
+    for (const n of names) {
+      const st = await fs.stat(`${dir}/${n}`);
+      out[n] = st.isDirectory() ? 'dir' : st.size;
+    }
+    return out;
+  } catch { return null; }
 }
 
 async function record(entry) {
