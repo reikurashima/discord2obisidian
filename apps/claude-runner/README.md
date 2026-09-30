@@ -151,6 +151,17 @@ if (result.status === 'ok') {
 | `echo.ping` | 全bot | `echo.v1` | なし（疎通確認用） |
 | `digest.extract` | 全bot | `digest.v1` | 読み取りのみ |
 | `invoice.extract` | `portal` のみ | `invoice.v1` | **Read だけ・作業ディレクトリ内だけ**。添付PDF必須 |
+| `task.triage` | `portal` のみ | `tasks.v1` | なし（文章だけで判断）。**モデルは sonnet 固定** |
+
+`task.triage` は本人が貼った雑なメモを、マイポータルの列（案件）ごとのタスクに振り分ける。
+- input は `{ text（最大4000文字）, today（YYYY-MM-DD）, projects: [{ id, name }] }`。形が違えば claude を回さず `rejected` / `BAD_JOB`
+- `input.text` は構造化入力から外し、`quoted` と同じく `<data>` の囲いに入れて渡す（貼られたメールの命令文を指示として扱わせないため）
+- プロンプトには runner が計算した「今日から42日分の暦（曜日つき・月曜始まり）」を添える。「来週金曜」の曜日の取り違えを防ぐため
+- `tasks.v1` は `{ "tasks": [{ title, projectId, notes, dueDate, starred }] }`（5キー固定・100件まで）。
+  `projectId` が `input.projects` に無い id なら**結果全体を捨てずに null に落とす**（＝ポータル側で受信箱へ）。
+  `notes: null` → `""`、`dueDate: ""` → null も同様に寄せる。それ以外（型違い・未知キー・title 200文字超・実在しない日付）は全か無か
+- ジョブの `"attachments": []` は「添付なし」として受け付ける（添付を使わない kind 共通。`invoice.extract` の空配列は従来どおり `BAD_JOB`）
+- 生の出力は他の kind と同じく残す（`redactLogs` ではない）
 
 `invoice.v1` は9キー固定（`issuer_name` `issue_date` `due_date` `amount_excl` `tax_amount`
 `amount_incl` `withholding` `invoice_number` `project_hint`）。読み取れない項目は null。
@@ -233,7 +244,7 @@ cd apps/claude-runner
 node test/run.mjs
 ```
 
-100項目（うち 46〜100 が添付・invoice.extract）。取り合い・タイムアウト・スキーマ不一致・APIキー削除・SIGTERM・添付の後始末などを
+117項目（うち 46〜100 が添付・invoice.extract、101〜117 が task.triage）。取り合い・タイムアウト・スキーマ不一致・APIキー削除・SIGTERM・添付の後始末などを
 本物の子プロセスを使って確認する。一時ディレクトリを使い、終わったら消す。
 
 ---
@@ -254,7 +265,8 @@ src/
   authDetect.js     ⚠ 認証切れの暫定判定（実機で詰める）
   health.js         health.json・疎通確認・webhook通知
   notify.js         Discord webhook（User-Agent 必須）
-  schemas/          digest.v1 / echo.v1 / invoice.v1
+  triage.js         task.triage 専用（input の検証・プロンプトに添える暦）
+  schemas/          digest.v1 / echo.v1 / invoice.v1 / tasks.v1
   client/           依頼側が使う薄いクライアント（依存なし）
   utils/            logger / fsx（アトミック書き込み）
 test/

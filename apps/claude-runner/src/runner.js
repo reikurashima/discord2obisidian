@@ -133,7 +133,9 @@ export function createRunner({ config, executor, onJobFinished = () => {} }) {
 
       exec = await executor({
         jobId, prompt, cwd: jobWorkDir, outDir, kindDef, schema,
-        model: job.model || null,
+        // kind 側でモデルを固定しているもの（task.triage = sonnet）はジョブの指定より優先する。
+        // 固定していない kind は従来どおりジョブの指定（無ければモデル指定なし）
+        model: kindDef.model || job.model || null,
         timeoutSec,
         attachments,
         job,
@@ -209,8 +211,11 @@ export function createRunner({ config, executor, onJobFinished = () => {} }) {
     // ---- スキーマ検証（★全か無か。部分的に採用しない）----
     // normalize はスキーマが持っていれば1回だけ通す（例: invoice.v1 の登録番号の形式違い → null）。
     // ⚠ キーの過不足・型違いは normalize では直さない。validate で全部捨てる
-    const output = typeof schema.normalize === 'function' ? schema.normalize(extracted.value) : extracted.value;
-    const verdict = schema.validate(output);
+    // 第2引数の { job } は、ジョブの入力と突き合わせるスキーマ用（tasks.v1 の projectId など）。
+    // 使わないスキーマ（digest / echo / invoice）は受け取らないだけなので挙動は変わらない
+    const schemaCtx = { job };
+    const output = typeof schema.normalize === 'function' ? schema.normalize(extracted.value, schemaCtx) : extracted.value;
+    const verdict = schema.validate(output, schemaCtx);
     if (!verdict.ok) {
       logger.warn(`[Job] ${jobId} schema mismatch (${schema.name}): ${verdict.errors.join(' / ')}`);
       return finishFailure({

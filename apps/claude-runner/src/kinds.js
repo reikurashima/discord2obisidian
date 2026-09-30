@@ -1,6 +1,7 @@
 import path from 'path';
 import { validateAttachmentList } from './attachments.js';
 import { schemaNames } from './schemas/index.js';
+import { buildTriageContext, validateTriageInput } from './triage.js';
 
 // ---- 依頼できる Bot（ホワイトリスト） ---------------------------------
 // キューのディレクトリ名と一致させる。ここに無い bot のジョブは即 failed。
@@ -24,6 +25,11 @@ export const BOTS = ['pm', 'portal'];
 // redactLogs: true … 生の出力（claude の stdout/stderr・解析結果・ジョブの input）を
 //              result の logTail と failed/ に残さない。残すのはエラーコードと「どの項目で落ちたか」だけ。
 //              機微情報（請求書の取引先・口座・金額）を 14日間ディスクに置かないため
+// model:       … この kind で使うモデルを固定する（ジョブ側の model より優先）。省略時はジョブの指定のまま
+// dataInputKeys … input のうち「人が書いた文章」のキー。プロンプトでは構造化入力から外し、
+//              quoted と同じく <data> の囲いに入れて無害化する（指示として解釈させないため）
+// validateInput(input) … input の形の検証。エラー文の配列を返し、1件でもあれば BAD_JOB で弾く
+// context(job) … プロンプトの「# 参考情報」に入れる行の配列（runner が計算した確かな値。暦など）
 
 const KINDS = {
   // 疎通確認。input.text をそのまま返させるだけ
@@ -71,6 +77,40 @@ const KINDS = {
       'issuer_name は請求元（この請求書を発行した側＝外注先）。宛先（「御中」「様」が付く請求先）と取り違えないこと。',
       'invoice_number は適格請求書発行事業者の登録番号（T＋13桁の数字）。請求書番号（No. 等）と混同しないこと。無ければ null。',
       'project_hint は件名・案件名。無ければ null。',
+    ],
+  },
+
+  // 本人が貼った雑なメモを、マイポータルのタスク（列＝案件ごと）に振り分ける（マイポータル用）
+  // ⚠ 文章だけで判断できるのでツールは一切使わせない。登録は依頼側（ポータル）が結果を見て行う
+  'task.triage': {
+    bots: ['portal'],
+    tools: 'none',
+    write: false,
+    // 本人方針で sonnet 固定（ジョブ側の model 指定より優先する）
+    model: 'sonnet',
+    outputSchemas: ['tasks.v1'],
+    // メモ本文（input.text）は <data> の囲いに移して渡す。
+    // ⚠ 本人が書いたメモでも、取引先のメール・チャットをそのまま貼ったものが混ざり得る。
+    //    その中の命令文を指示として解釈させないため、quoted と同じ扱いにする
+    dataInputKeys: ['text'],
+    validateInput: validateTriageInput,
+    // 今日の曜日と先6週間の暦（「来週金曜」を日付に直すための表）
+    context: buildTriageContext,
+    role: [
+      'あなたは、本人が書いた雑なメモを「やることリスト（タスク）」に整理する振り分け係です。',
+      'メモに**書かれていることだけ**をタスクにします。書かれていないタスク・期限・補足を推測で足さないでください。',
+    ].join('\n'),
+    instructions: [
+      'メモ（<data> の中の input.text）を読み、**意味のまとまりごとに**タスクへ分けること。1行1タスクとは限らない（1行に2つの用事があれば2件、複数行で1つの用事なら1件）。',
+      'title は短く具体的に、「〜する」で終わる程度の一文にすること（例: 「背景モデルの修正を送る」）。200文字以内。メモの言い回しを整えるのはよいが、意味を変えないこと。',
+      'projectId は input.projects の name（列名）から最も合う列を選び、その **id** を書くこと。**自信が無ければ null**（依頼側で「受信箱」に入る）。',
+      '**新しい列（projects に無い id）を作らないこと。** 合う列が無ければ null にすること。',
+      'dueDate はメモに期限が書かれている場合だけ、「# 参考情報」の暦を引いて YYYY-MM-DD に直すこと（例: 「明日」「来週金曜」「10/5まで」）。',
+      '年の無い日付（例: 10/5）は今日以降で最も近いその日にすること。期限が書かれていなければ null にすること。',
+      '「急ぎ」「至急」「重要」「!!」など急ぎ・重要を示す言葉があるタスクだけ starred を true にすること。それ以外は false。',
+      'notes はメモに書かれた補足（相手・数量・条件など）をタスクごとに短く添える。無ければ空文字 ""。メモに無いことを書かないこと。',
+      '空行・あいさつ・雑談・感想・「済」「完了」「done」など**既に終わったと書いてあるもの**はタスクにしないこと。',
+      'タスクが1件も無ければ {"tasks": []} を返すこと。',
     ],
   },
 };
@@ -209,13 +249,22 @@ export function validateJobShape(job, fileName, laneBot) {
   }
   // 添付。名前の形（パストラバーサル対策）はここで弾く。ファイルの有無は runner が見る
   // ⚠ 許すのは ["<jobId>.pdf"] の1件だけ（他のジョブの添付を指させない）
-  errors.push(...validateAttachmentList(job.attachments, job.jobId));
+  // ⚠ 添付を受け付けない kind の空配列（"attachments": []）は「添付なし」として通す。
+  //    task.triage の契約ではポータルが [] を付けて送ってくるため。
+  //    添付を使う kind（invoice.extract）の空配列は従来どおり BAD_JOB（["<jobId>.pdf"] の1件だけ）
+  const noAttachmentsGiven = !kindDef.attachments && Array.isArray(job.attachments) && job.attachments.length === 0;
+  if (!noAttachmentsGiven) errors.push(...validateAttachmentList(job.attachments, job.jobId));
   const attachmentCount = Array.isArray(job.attachments) ? job.attachments.length : 0;
   if (!kindDef.attachments && attachmentCount > 0) {
     errors.push(`kind "${job.kind}" does not accept attachments`);
   }
   if (kindDef.attachments === 'required' && attachmentCount === 0) {
     errors.push(`kind "${job.kind}" requires at least one attachment`);
+  }
+  // kind 固有の input 検証（task.triage の text 4000文字上限・today 必須など）。
+  // ⚠ 壊れた入力で claude を回しても推測で埋めた結果しか返らないので、実行前に弾く
+  if (typeof kindDef.validateInput === 'function') {
+    errors.push(...kindDef.validateInput(job.input));
   }
   if (errors.length > 0) return { errorCode: 'BAD_JOB', errors };
 

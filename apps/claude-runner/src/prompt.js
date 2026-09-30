@@ -26,6 +26,16 @@ function fence(lang, body) {
   return ['```' + lang, body, '```'].join('\n');
 }
 
+function isPlainObject(v) {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function omitKeys(obj, keys) {
+  const out = { ...obj };
+  for (const k of keys) delete out[k];
+  return out;
+}
+
 /**
  * @param {object} job     検証済みのジョブJSON
  * @param {object} kindDef kinds.js の定義
@@ -82,9 +92,26 @@ export function buildPrompt(job, kindDef, schema, paths) {
     lines.push('');
   }
 
+  // ---- 参考情報（runner が計算した確かな値。task.triage の暦など。無い kind では出さない）----
+  const context = typeof kindDef.context === 'function' ? kindDef.context(job) : [];
+  if (Array.isArray(context) && context.length > 0) {
+    lines.push('# 参考情報');
+    context.forEach((s) => lines.push(s));
+    lines.push('');
+  }
+
   // ---- 構造化入力（依頼側が組み立てた信頼できるデータ） ----
+  // ⚠ dataInputKeys に挙がったキー（人が書いた文章）はここから外し、下の <data> に移す。
+  //    JSON のまま載せると「信頼できる入力」の側に紛れてしまうため
+  const dataKeys = Array.isArray(kindDef.dataInputKeys) ? kindDef.dataInputKeys : [];
+  const input = job.input ?? {};
+  const inputForPrompt = dataKeys.length > 0 && isPlainObject(input) ? omitKeys(input, dataKeys) : input;
+  const movedKeys = dataKeys.filter((k) => isPlainObject(input) && k in input);
   lines.push('# 入力（依頼元が組み立てた構造化データ）');
-  lines.push(fence('json', JSON.stringify(job.input ?? {}, null, 2)));
+  lines.push(fence('json', JSON.stringify(inputForPrompt, null, 2)));
+  if (movedKeys.length > 0) {
+    lines.push(`※ ${movedKeys.map((k) => `input.${k}`).join(' / ')} は人が書いた文章なので、下の <data> ブロックに入れてあります。`);
+  }
   lines.push('');
 
   // ---- ③ 引用（他人が書いた文章＝データ） ----
@@ -93,9 +120,16 @@ export function buildPrompt(job, kindDef, schema, paths) {
   lines.push('');
   lines.push('<data>');
   const quoted = Array.isArray(job.quoted) ? job.quoted : [];
-  if (quoted.length === 0) {
+  // input から移した文章（dataInputKeys）。quoted と同じく無害化して囲いの中に置く
+  movedKeys.forEach((k, i) => {
+    if (i > 0) lines.push('');
+    lines.push(`[input.${k}]`);
+    lines.push(neutralizeQuotedText(typeof input[k] === 'string' ? input[k] : JSON.stringify(input[k])));
+  });
+  if (movedKeys.length > 0 && quoted.length > 0) lines.push('');
+  if (quoted.length === 0 && movedKeys.length === 0) {
     lines.push('(引用なし)');
-  } else {
+  } else if (quoted.length > 0) {
     quoted.forEach((q, i) => {
       // メタ情報も一応無害化しておく（author に細工が入る余地を消す）
       const meta = [
